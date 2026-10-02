@@ -1,0 +1,4 @@
+kind: Fixed
+body: |-
+    Accept ProtoJSON `Duration` strings with an explicit leading `+` sign.
+time: 2026-10-02T20:52:00+02:00

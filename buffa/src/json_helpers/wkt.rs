@@ -195,7 +195,9 @@ pub fn fmt_duration(secs: i64, nanos: i32) -> Result<String, &'static str> {
     Ok(format!("{sign}{abs_secs}{frac}s"))
 }
 
-/// Parse a `"3.5s"`-style decimal seconds string into `(seconds, nanos)`.
+/// Parse an optional-sign `"3.5s"`-style decimal seconds string into `(seconds, nanos)`.
+///
+/// Accepts an explicit leading `+`, matching the protobuf JSON parser.
 ///
 /// # Errors
 ///
@@ -206,6 +208,8 @@ pub fn parse_duration(s: &str) -> Result<(i64, i32), &'static str> {
     let negative = body.starts_with('-');
     let body = if negative {
         body.strip_prefix('-').ok_or("malformed sign")?
+    } else if let Some(rest) = body.strip_prefix('+') {
+        rest
     } else {
         body
     };
@@ -495,6 +499,19 @@ mod tests {
             assert_eq!(fmt_duration(secs, nanos).unwrap(), expected);
             assert_eq!(parse_duration(expected).unwrap(), (secs, nanos));
         }
+    }
+
+    #[test]
+    fn duration_accepts_explicit_positive_sign() {
+        let cases = [
+            ("+1s", (1, 0)),
+            ("+1.5s", (1, 500_000_000)),
+            ("+0.000000001s", (0, 1)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_duration(input), Ok(expected), "{input}");
+        }
+        assert_eq!(parse_duration("++1s"), Err("malformed sign"));
     }
 
     #[test]
