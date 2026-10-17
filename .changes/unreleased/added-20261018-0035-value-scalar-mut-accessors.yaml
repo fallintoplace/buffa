@@ -1,0 +1,4 @@
+kind: Added
+body: |-
+    **`buffa-types`: mutable scalar accessors for `google.protobuf.Value`**. `as_number_mut`, `as_str_mut`, and `as_bool_mut` allow callers to edit the current scalar value in place. Each method returns `None` when the stored variant does not match.
+time: 2026-10-18T00:35:00+02:00
