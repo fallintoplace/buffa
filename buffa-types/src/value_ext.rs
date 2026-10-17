@@ -65,6 +65,33 @@ impl Value {
         }
     }
 
+    /// Returns a mutable reference to the number if this is a number, or
+    /// `None` for another variant.
+    pub fn as_number_mut(&mut self) -> Option<&mut f64> {
+        match &mut self.kind {
+            Some(KindOneof::NumberValue(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Returns a mutable reference to the string if this is a string, or
+    /// `None` for another variant. The string can be resized in place.
+    pub fn as_str_mut(&mut self) -> Option<&mut String> {
+        match &mut self.kind {
+            Some(KindOneof::StringValue(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Returns a mutable reference to the boolean if this is a bool, or
+    /// `None` for another variant.
+    pub fn as_bool_mut(&mut self) -> Option<&mut bool> {
+        match &mut self.kind {
+            Some(KindOneof::BoolValue(b)) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Returns a mutable reference to the [`Struct`] if this is a struct value.
     pub fn as_struct_mut(&mut self) -> Option<&mut Struct> {
         match &mut self.kind {
@@ -1170,6 +1197,47 @@ mod tests {
     }
 
     // ---- mutable accessors ------------------------------------------------
+
+    #[test]
+    fn mutable_scalar_accessors_update_values() {
+        let mut number = Value::from(1.5_f64);
+        *number.as_number_mut().unwrap() = 2.5;
+        assert_eq!(number.as_number(), Some(2.5));
+
+        let mut string = Value::from("Ada");
+        string.as_str_mut().unwrap().push_str(" Lovelace");
+        assert_eq!(string.as_str(), Some("Ada Lovelace"));
+
+        let mut boolean = Value::from(false);
+        *boolean.as_bool_mut().unwrap() = true;
+        assert_eq!(boolean.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn mutable_scalar_accessors_return_none_for_other_variants() {
+        let mut number = Value::from(1.5_f64);
+        assert!(number.as_str_mut().is_none());
+        assert!(number.as_bool_mut().is_none());
+
+        let mut string = Value::from("hi");
+        assert!(string.as_number_mut().is_none());
+        assert!(string.as_bool_mut().is_none());
+
+        let mut boolean = Value::from(false);
+        assert!(boolean.as_number_mut().is_none());
+        assert!(boolean.as_str_mut().is_none());
+
+        for mut value in [
+            Value::null(),
+            Value::default(),
+            Value::from(Struct::new()),
+            Value::from(ListValue::default()),
+        ] {
+            assert!(value.as_number_mut().is_none());
+            assert!(value.as_str_mut().is_none());
+            assert!(value.as_bool_mut().is_none());
+        }
+    }
 
     #[test]
     fn as_struct_mut_returns_some_for_struct_value() {

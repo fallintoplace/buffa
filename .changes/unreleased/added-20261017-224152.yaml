@@ -1,0 +1,4 @@
+kind: Added
+body: |-
+    **`Value` exposes mutable scalar accessors**. `as_number_mut`, `as_str_mut`, and `as_bool_mut` let callers edit the stored number, string, or bool in place, returning `None` for other variants.
+time: 2026-10-17T22:41:52Z
