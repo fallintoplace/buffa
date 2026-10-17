@@ -1,0 +1,3 @@
+kind: Changed
+body: '**Extension JSON serialization avoids allocating a deduplication set for unrelated unknown fields.** Only registered extension field numbers enter the set, and each registered extension still appears once in its original order.'
+time: 2026-10-18T00:16:00+02:00

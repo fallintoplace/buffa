@@ -192,16 +192,20 @@ pub fn serialize_extensions<S: serde::Serializer>(
     // Emit each extension once: the first record at a field number triggers
     // the lookup; the entry's to_json reads all records at that number (for
     // merge-semantics on messages, last-wins on scalars, collect on repeated).
-    let mut seen: HashSet<u32> = HashSet::with_capacity(fields.len());
+    let Some(entries) = reg.by_number.get(extendee) else {
+        return map.end();
+    };
+    let mut seen: HashSet<u32> = HashSet::new();
     for uf in fields.iter() {
+        let Some(entry) = entries.get(&uf.number) else {
+            continue;
+        };
         if !seen.insert(uf.number) {
             continue;
         }
-        if let Some(entry) = reg.by_number(extendee, uf.number) {
-            let json = (entry.to_json)(uf.number, fields).map_err(S::Error::custom)?;
-            let key = format!("[{}]", entry.full_name);
-            map.serialize_entry(&key, &json)?;
-        }
+        let json = (entry.to_json)(uf.number, fields).map_err(S::Error::custom)?;
+        let key = format!("[{}]", entry.full_name);
+        map.serialize_entry(&key, &json)?;
     }
     map.end()
 }
@@ -1376,6 +1380,45 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({"[pkg.weight]": 7}));
+    }
+
+    #[test]
+    fn serialize_extensions_skips_unregistered_unknown_fields() {
+        let _guard = crate::test_doubles::REGISTRY_TEST_LOCK.lock().unwrap();
+        let mut reg = ExtensionRegistry::new();
+        reg.register(entry!(50, "pkg.weight", "pkg.Carrier"));
+        set_extension_registry(Box::new(reg));
+
+        let mut fields = UnknownFields::new();
+        for number in 100..1100 {
+            fields.push(UnknownField {
+                number,
+                data: UnknownFieldData::Varint(u64::from(number)),
+            });
+        }
+
+        let json = serde_json::to_value(SerWrap {
+            extendee: "pkg.Carrier",
+            fields: &fields,
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({}));
+
+        fields.push(UnknownField {
+            number: 50,
+            data: UnknownFieldData::Varint(7),
+        });
+        fields.push(UnknownField {
+            number: 50,
+            data: UnknownFieldData::Varint(9),
+        });
+
+        let json = serde_json::to_value(SerWrap {
+            extendee: "pkg.Carrier",
+            fields: &fields,
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({"[pkg.weight]": 9}));
     }
 
     #[test]
