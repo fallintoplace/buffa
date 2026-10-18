@@ -62,6 +62,22 @@ impl Timestamp {
         }
     }
 
+    /// Create a [`Timestamp`] from milliseconds since the Unix epoch.
+    ///
+    /// Negative offsets use floor division so `-1` millisecond becomes
+    /// `seconds: -1, nanos: 999_000_000`, matching the protobuf convention
+    /// that nanoseconds are always non-negative.
+    ///
+    /// Like [`from_unix_secs`](Self::from_unix_secs), this constructor does
+    /// not enforce the protobuf year 0001–9999 range.
+    pub fn from_unix_millis(millis: i64) -> Self {
+        Self {
+            seconds: millis.div_euclid(1_000),
+            nanos: (millis.rem_euclid(1_000) * 1_000_000) as i32,
+            ..Default::default()
+        }
+    }
+
     /// Create a [`Timestamp`] from a Unix epoch offset, returning `None` if
     /// `nanos` is outside `[0, 999_999_999]`.
     pub fn from_unix_checked(seconds: i64, nanos: i32) -> Option<Self> {
@@ -317,6 +333,43 @@ mod tests {
         let ts = Timestamp::from_unix_secs(i64::MAX);
         assert_eq!(ts.seconds, i64::MAX);
         assert_eq!(ts.nanos, 0);
+    }
+
+    #[test]
+    fn from_unix_millis_positive_and_exact_seconds() {
+        let ts = Timestamp::from_unix_millis(1_500);
+        assert_eq!((ts.seconds, ts.nanos), (1, 500_000_000));
+
+        let exact = Timestamp::from_unix_millis(2_000);
+        assert_eq!((exact.seconds, exact.nanos), (2, 0));
+
+        let epoch = Timestamp::from_unix_millis(0);
+        assert_eq!((epoch.seconds, epoch.nanos), (0, 0));
+    }
+
+    #[test]
+    fn from_unix_millis_negative_offsets() {
+        let single = Timestamp::from_unix_millis(-1);
+        assert_eq!((single.seconds, single.nanos), (-1, 999_000_000));
+
+        let fraction = Timestamp::from_unix_millis(-1_500);
+        assert_eq!((fraction.seconds, fraction.nanos), (-2, 500_000_000));
+
+        let exact = Timestamp::from_unix_millis(-2_000);
+        assert_eq!((exact.seconds, exact.nanos), (-2, 0));
+    }
+
+    #[test]
+    fn from_unix_millis_extreme_values() {
+        for millis in [i64::MIN, i64::MAX] {
+            let ts = Timestamp::from_unix_millis(millis);
+            assert!((0..1_000_000_000).contains(&ts.nanos));
+            // i128 avoids overflow when reconstructing the i64 millisecond input.
+            assert_eq!(
+                i128::from(ts.seconds) * 1_000 + i128::from(ts.nanos) / 1_000_000,
+                i128::from(millis)
+            );
+        }
     }
 
     #[test]

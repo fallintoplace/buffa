@@ -1,0 +1,3 @@
+kind: Added
+body: '**`Timestamp::from_unix_millis` converts Unix epoch milliseconds into a protobuf timestamp.** Negative millisecond offsets are normalized to a negative seconds component and non-negative nanoseconds, including the millisecond immediately before the epoch.'
+time: 2026-10-18T15:07:00+02:00
