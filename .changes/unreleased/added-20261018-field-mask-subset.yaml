@@ -1,0 +1,4 @@
+kind: Added
+body: |-
+    **`FieldMask::is_subset_of` checks whether every selected path is covered by another mask.** It follows `covers` semantics: an ancestor in the other mask covers descendants, but children do not cover their parent. Empty masks select nothing, and no normalization or allocation is needed.
+time: 2026-10-18T15:07:00+02:00

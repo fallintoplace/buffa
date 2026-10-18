@@ -81,6 +81,33 @@ impl FieldMask {
             .any(|ancestor| path_is_covered(path, ancestor))
     }
 
+    /// Returns `true` if every path in this mask is covered by `other`.
+    ///
+    /// Coverage follows the same rules as [`covers`](Self::covers): an exact
+    /// match or ancestor in `other` covers a path in this mask. Several child
+    /// paths do not cover their parent. Dots mark component boundaries,
+    /// and neither mask is normalized or modified.
+    ///
+    /// An empty mask is a subset of every mask, including another empty mask.
+    /// This treats an empty mask as selecting nothing; APIs where an absent
+    /// update mask selects all fields must handle that convention separately.
+    /// Runs in O(n*m) path comparisons.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use buffa_types::FieldMask;
+    ///
+    /// let precise = FieldMask::from_paths(["user.name", "settings.theme"]);
+    /// let broad = FieldMask::from_paths(["user", "settings"]);
+    /// assert!(precise.is_subset_of(&broad));
+    /// assert!(!broad.is_subset_of(&precise));
+    /// ```
+    #[must_use]
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        self.paths.iter().all(|path| other.covers(path))
+    }
+
     /// Returns `true` if this mask contains `path`, an ancestor of `path`, or
     /// a descendant of `path`.
     ///
@@ -504,6 +531,37 @@ mod tests {
         }
         assert!(!FieldMask::default().covers("user"));
         assert!(!FieldMask::from_paths(["*"]).covers("user"));
+    }
+
+    #[test]
+    fn subset_checks_ancestor_coverage_and_direction() {
+        let precise = FieldMask::from_paths(["user.name", "user.email", "settings.theme"]);
+        let broad = FieldMask::from_paths(["user", "settings"]);
+        assert!(precise.is_subset_of(&broad));
+        assert!(!broad.is_subset_of(&precise));
+        assert!(precise.is_subset_of(&precise));
+    }
+
+    #[test]
+    fn subset_requires_coverage_of_entire_parent() {
+        let parent = FieldMask::from_paths(["user"]);
+        let children = FieldMask::from_paths(["user.name", "user.email"]);
+        assert!(!parent.is_subset_of(&children));
+        assert!(children.is_subset_of(&parent));
+    }
+
+    #[test]
+    fn subset_handles_empty_duplicates_and_component_boundaries() {
+        let empty = FieldMask::default();
+        let duplicates = FieldMask::from_paths(["user", "user"]);
+        assert!(empty.is_subset_of(&empty));
+        assert!(empty.is_subset_of(&duplicates));
+        assert!(!duplicates.is_subset_of(&empty));
+        assert!(duplicates.is_subset_of(&FieldMask::from_paths(["user"])));
+        assert!(!FieldMask::from_paths(["username"]).is_subset_of(&duplicates));
+        assert!(!FieldMask::from_paths(["User"]).is_subset_of(&duplicates));
+        assert!(!FieldMask::from_paths(["*"]).is_subset_of(&duplicates));
+        assert!(FieldMask::from_paths([".child"]).is_subset_of(&FieldMask::from_paths([""])));
     }
 
     #[test]
