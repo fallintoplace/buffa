@@ -331,3 +331,107 @@ fn the_warning_names_the_buffa_build_methods() {
         "{dependency}"
     );
 }
+
+/// Add a singular message field and a message-typed oneof member to the
+/// no-package fixture. Scalar oneof members remain for wrong-target tests.
+fn storage_rules_file() -> FileDescriptorProto {
+    let mut file = holder_file();
+    let holder = &mut file.message_type[0];
+    let mut child = make_field("child", 5, Label::LABEL_OPTIONAL, Type::TYPE_MESSAGE);
+    child.type_name = Some(".Holder.Inner".to_string());
+    holder.field.push(child);
+    let mut node = make_field("node", 6, Label::LABEL_OPTIONAL, Type::TYPE_MESSAGE);
+    node.type_name = Some(".Holder.Inner".to_string());
+    node.oneof_index = Some(0);
+    holder.field.push(node);
+    // A nested singular message field must also count as a storage target.
+    holder.nested_type.push(DescriptorProto {
+        name: Some("Leaf".to_string()),
+        ..Default::default()
+    });
+    let mut deep = make_field("deep", 7, Label::LABEL_OPTIONAL, Type::TYPE_MESSAGE);
+    deep.type_name = Some(".Holder.Leaf".to_string());
+    holder.nested_type[1].field.push(deep);
+    file
+}
+
+#[test]
+fn pointer_and_unbox_rules_warn_for_missing_or_wrong_targets() {
+    let config = CodeGenConfig {
+        pointer_fields: vec![
+            (".Holder".to_string(), PointerRepr::Box),
+            (".Holder.child".to_string(), PointerRepr::Box),
+            (".Holder.Inner.deep".to_string(), PointerRepr::Box),
+            (".Holder.Inner.deap".to_string(), PointerRepr::Box),
+            (".Holder.pick.node".to_string(), PointerRepr::Box),
+            (".Holder.pick.label".to_string(), PointerRepr::Box),
+            (".Holder.pick.naem".to_string(), PointerRepr::Box),
+            ("Holder.child".to_string(), PointerRepr::Box),
+        ],
+        unboxed_oneof_fields: vec![
+            ".".to_string(),
+            ".Holder".to_string(),
+            ".Holder.pick.node".to_string(),
+            ".Holder.pick.label".to_string(),
+            ".Holder.node".to_string(),
+            "Holder.pick.node".to_string(),
+        ],
+        ..Default::default()
+    };
+    let (_, warnings) =
+        generate_with_diagnostics(&[storage_rules_file()], &["holder.proto".to_string()], &config)
+            .expect("storage rules should generate");
+    assert_eq!(
+        inert_rules(warnings),
+        [
+            ("pointer_fields", ".Holder.Inner.deap".to_string(), false),
+            ("pointer_fields", ".Holder.pick.label".to_string(), false),
+            ("pointer_fields", ".Holder.pick.naem".to_string(), false),
+            ("pointer_fields", "Holder.child".to_string(), false),
+            ("unboxed_oneof_fields", ".Holder.node".to_string(), false),
+            ("unboxed_oneof_fields", ".Holder.pick.label".to_string(), false),
+            ("unboxed_oneof_fields", "Holder.pick.node".to_string(), false),
+        ]
+    );
+}
+
+#[test]
+fn storage_rules_matching_only_dependency_files_warn() {
+    let config = CodeGenConfig {
+        pointer_fields: vec![(".Holder.child".to_string(), PointerRepr::Box)],
+        unboxed_oneof_fields: vec![".Holder.pick.node".to_string()],
+        ..Default::default()
+    };
+    let (_, warnings) = generate_with_diagnostics(
+        &[rules_file(), storage_rules_file()],
+        &["rules.proto".to_string()],
+        &config,
+    )
+    .expect("dependency-only rules should not fail generation");
+    assert_eq!(
+        inert_rules(warnings),
+        [
+            ("pointer_fields", ".Holder.child".to_string(), true),
+            ("unboxed_oneof_fields", ".Holder.pick.node".to_string(), true),
+        ]
+    );
+}
+
+#[test]
+fn storage_rule_warnings_name_the_build_options() {
+    for (option, method) in [
+        ("pointer_fields", "box_type_in / box_type_custom_in"),
+        ("unboxed_oneof_fields", "unbox_oneof_in"),
+    ] {
+        let warning = CodeGenWarning::FieldTypeRuleMatchedNothing {
+            rule: ".Holder.typo".to_string(),
+            option,
+            matches_ungenerated: false,
+        }
+        .to_string();
+        assert!(
+            warning.contains(&format!("(buffa-build: {method})")),
+            "{warning}"
+        );
+    }
+}

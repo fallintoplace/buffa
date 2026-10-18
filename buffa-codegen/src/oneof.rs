@@ -158,7 +158,11 @@ fn raw_pointer_repr(
 /// than surfaced as errors: protoc always populates them for real oneof
 /// members, and `collect_variant_info` independently reports `MissingField`
 /// for any descriptor malformed enough to hit this in practice.
-fn for_each_message_variant(msg: &DescriptorProto, msg_fqn: &str, mut f: impl FnMut(String, &str)) {
+pub(crate) fn for_each_message_variant(
+    msg: &DescriptorProto,
+    msg_fqn: &str,
+    mut f: impl FnMut(String, &str),
+) {
     for field in &msg.field {
         if !crate::impl_message::is_real_oneof_member(field) {
             continue;
@@ -194,7 +198,7 @@ fn for_each_message_variant(msg: &DescriptorProto, msg_fqn: &str, mut f: impl Fn
 /// These are the fields whose [`PointerRepr`](crate::PointerRepr) governs
 /// inline-vs-heap storage; repeated and map fields are heap-backed and break
 /// cycles regardless of pointer config.
-fn for_each_singular_message_field(
+pub(crate) fn for_each_singular_message_field(
     msg: &DescriptorProto,
     msg_fqn: &str,
     mut f: impl FnMut(String, &str),

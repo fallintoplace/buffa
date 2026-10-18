@@ -1,0 +1,4 @@
+kind: Added
+body: |-
+    **`buffa-codegen` warns when `box_type_in` or `unbox_oneof_in` matches no generated storage target** (closes #619). Checks recognize singular message fields and full `Message.oneof.member` paths for message-typed oneof variants, and distinguish missing targets from matches confined to dependency files.
+time: 2026-10-19T01:13:00+02:00
