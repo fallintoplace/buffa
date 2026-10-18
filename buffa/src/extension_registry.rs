@@ -189,19 +189,25 @@ pub fn serialize_extensions<S: serde::Serializer>(
         return map.end();
     }
 
-    // Emit each extension once: the first record at a field number triggers
-    // the lookup; the entry's to_json reads all records at that number (for
-    // merge-semantics on messages, last-wins on scalars, collect on repeated).
-    let mut seen: HashSet<u32> = HashSet::with_capacity(fields.len());
+    // Resolve the extendee once, and avoid work if none of its extensions
+    // are registered. Unregistered unknown fields never appear in JSON.
+    let Some(entries) = reg.by_number.get(extendee) else {
+        return map.end();
+    };
+
+    // Emit each registered extension once, in first-seen order. The entry's
+    // to_json reads all records at that number (merge / last-wins semantics).
+    let mut seen: HashSet<u32> = HashSet::new();
     for uf in fields.iter() {
+        let Some(entry) = entries.get(&uf.number) else {
+            continue;
+        };
         if !seen.insert(uf.number) {
             continue;
         }
-        if let Some(entry) = reg.by_number(extendee, uf.number) {
-            let json = (entry.to_json)(uf.number, fields).map_err(S::Error::custom)?;
-            let key = format!("[{}]", entry.full_name);
-            map.serialize_entry(&key, &json)?;
-        }
+        let json = (entry.to_json)(uf.number, fields).map_err(S::Error::custom)?;
+        let key = format!("[{}]", entry.full_name);
+        map.serialize_entry(&key, &json)?;
     }
     map.end()
 }
@@ -1407,6 +1413,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({"[pkg.weight]": 9}));
+    }
+
+    #[test]
+    fn serialize_extensions_skips_unregistered_field_numbers_and_extendees() {
+        let _guard = crate::test_doubles::REGISTRY_TEST_LOCK.lock().unwrap();
+        let mut reg = ExtensionRegistry::new();
+        reg.register(entry!(50, "pkg.weight", "pkg.Carrier"));
+        set_extension_registry(Box::new(reg));
+
+        let mut fields = UnknownFields::new();
+        for number in 100..1124 {
+            fields.push(UnknownField {
+                number,
+                data: UnknownFieldData::Varint(u64::from(number)),
+            });
+        }
+
+        // Registered extendee with no matching fields, and an unregistered
+        // extendee, both produce an empty object.
+        for extendee in ["pkg.Carrier", "pkg.Other"] {
+            let json = serde_json::to_value(SerWrap {
+                extendee,
+                fields: &fields,
+            })
+            .unwrap();
+            assert_eq!(json, serde_json::json!({}));
+        }
     }
 
     // Helper: a Serialize wrapper that calls serialize_extensions.

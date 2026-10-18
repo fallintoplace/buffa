@@ -1,0 +1,4 @@
+kind: Changed
+body: |-
+    **Extension JSON serialization skips unregistered unknown fields before deduplication.** For messages with many unknown wire fields, only registered extension numbers are tracked, and an extendee with no registered extensions returns an empty JSON object without scanning the fields. Serialized values and their first-seen ordering are unchanged.
+time: 2026-10-18T15:13:51.306Z
