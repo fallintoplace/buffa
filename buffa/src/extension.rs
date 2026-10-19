@@ -1953,7 +1953,6 @@ mod tests {
         assert_eq!(c.extension(&E), vec![-1_i64, 0, i64::MAX]);
     }
 
-
     #[test]
     fn packed_fixed_width_extenders_append_only_complete_elements() {
         for count in [0usize, 1, 15, 16, 17, 1024] {
