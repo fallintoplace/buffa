@@ -1165,8 +1165,9 @@ pub mod codecs {
                 return Ok(());
             }
             // Each packed scalar needs at least one wire byte. Start with
-            // that conservative lower bound, including for varint codecs.
-            let mut buf = Vec::with_capacity(value.len());
+            // that lower bound, but keep Vec's default small-buffer capacity
+            // so tiny multi-byte varints do not require extra growth.
+            let mut buf = Vec::with_capacity(value.len().max(8));
             for v in &value {
                 C::encode_packed(v, &mut buf);
             }
