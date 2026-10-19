@@ -1,0 +1,4 @@
+kind: Changed
+body: |-
+    **Batch unescaped textproto bytes and strings into spans.** Writing contiguous plain-text runs in one call reduces per-character formatting overhead while preserving existing escapes for controls, quotes, and non-ASCII bytes.
+time: 2026-10-19T17:15:00.000000000+00:00
