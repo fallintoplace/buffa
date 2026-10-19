@@ -261,16 +261,28 @@ fn push_utf8(out: &mut Vec<u8>, cp: u32) -> Result<(), UnescapeError> {
 /// # Errors
 ///
 /// Propagates [`core::fmt::Error`] from the underlying writer.
+
 pub fn escape_bytes<W: Write + ?Sized>(bytes: &[u8], w: &mut W) -> core::fmt::Result {
     w.write_char('"')?;
-    for &b in bytes {
+    // Batch printable ASCII bytes into one write per run. The slow path
+    // still escapes every special or non-ASCII byte exactly as before.
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if (0x20..=0x7E).contains(&b) && b != b'"' && b != b'\\' {
+            continue;
+        }
+        if start != i {
+            // Every byte in this span is printable ASCII, even if the input
+            // itself contains arbitrary non-UTF-8 bytes.
+            let ascii = core::str::from_utf8(&bytes[start..i]).expect("printable ASCII");
+            w.write_str(ascii)?;
+        }
         match b {
             b'"' => w.write_str("\\\"")?,
             b'\\' => w.write_str("\\\\")?,
             b'\n' => w.write_str("\\n")?,
             b'\r' => w.write_str("\\r")?,
             b'\t' => w.write_str("\\t")?,
-            0x20..=0x7E => w.write_char(b as char)?,
             _ => {
                 // Three-digit octal. Always three digits so the next char
                 // can't be misread as continuing the escape.
@@ -280,6 +292,11 @@ pub fn escape_bytes<W: Write + ?Sized>(bytes: &[u8], w: &mut W) -> core::fmt::Re
                 w.write_char((b'0' + (b & 7)) as char)?;
             }
         }
+        start = i + 1;
+    }
+    if start < bytes.len() {
+        let ascii = core::str::from_utf8(&bytes[start..]).expect("printable ASCII");
+        w.write_str(ascii)?;
     }
     w.write_char('"')
 }
@@ -294,16 +311,26 @@ pub fn escape_bytes<W: Write + ?Sized>(bytes: &[u8], w: &mut W) -> core::fmt::Re
 /// # Errors
 ///
 /// Propagates [`core::fmt::Error`] from the underlying writer.
+
 pub fn escape_str<W: Write + ?Sized>(s: &str, w: &mut W) -> core::fmt::Result {
     w.write_char('"')?;
-    for c in s.chars() {
+    // char_indices preserves UTF-8 boundaries when passing unescaped spans
+    // directly to the writer, including multibyte Unicode characters.
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if !matches!(c, '"' | '\\' | '\n' | '\r' | '\t' | '\x00'..='\x1F' | '\x7F') {
+            continue;
+        }
+        if start != i {
+            w.write_str(&s[start..i])?;
+        }
         match c {
             '"' => w.write_str("\\\"")?,
             '\\' => w.write_str("\\\\")?,
             '\n' => w.write_str("\\n")?,
             '\r' => w.write_str("\\r")?,
             '\t' => w.write_str("\\t")?,
-            '\x00'..='\x1F' | '\x7F' => {
+            _ => {
                 // Octal escape for control chars.
                 let b = c as u8;
                 w.write_char('\\')?;
@@ -311,8 +338,12 @@ pub fn escape_str<W: Write + ?Sized>(s: &str, w: &mut W) -> core::fmt::Result {
                 w.write_char((b'0' + ((b >> 3) & 7)) as char)?;
                 w.write_char((b'0' + (b & 7)) as char)?;
             }
-            _ => w.write_char(c)?,
         }
+        // Every escaped character is one ASCII byte.
+        start = i + 1;
+    }
+    if start < s.len() {
+        w.write_str(&s[start..])?;
     }
     w.write_char('"')
 }
@@ -510,6 +541,56 @@ mod tests {
             assert_eq!(unescape(input), Err(expected), "input: {input:?}");
             assert_eq!(unescape_str(input), Err(expected), "input: {input:?}");
         }
+    }
+
+
+    #[test]
+    fn escape_bytes_bulk_ascii_and_binary_round_trip() {
+        let mut bytes = b"repeated printable text ".repeat(256);
+        bytes.extend(0u8..=255);
+        bytes.extend(b"tail".repeat(1024));
+        let mut out = String::new();
+        escape_bytes(&bytes, &mut out).unwrap();
+        assert_eq!(unescape(&out).unwrap(), bytes);
+    }
+
+    #[test]
+    fn escape_str_bulk_unicode_and_controls_round_trip() {
+        let original = alloc::format!(
+            "{}{} \n\t\\\"\x1F\x7F",
+            "café 🌟".repeat(256),
+            "plain ASCII ".repeat(1024)
+        );
+        let mut out = String::new();
+        escape_str(&original, &mut out).unwrap();
+        assert_eq!(unescape_str(&out).unwrap(), original);
+    }
+
+    #[test]
+    fn escape_plain_ascii_writes_one_span() {
+        #[derive(Default)]
+        struct CountingWriter {
+            writes: usize,
+            output: String,
+        }
+        impl core::fmt::Write for CountingWriter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                self.writes += 1;
+                self.output.push_str(s);
+                Ok(())
+            }
+        }
+
+        let input = "a".repeat(4096);
+        let mut bytes = CountingWriter::default();
+        escape_bytes(input.as_bytes(), &mut bytes).unwrap();
+        assert_eq!(bytes.writes, 3); // quote, ASCII span, quote
+        assert_eq!(bytes.output, alloc::format!("\"{input}\""));
+
+        let mut text = CountingWriter::default();
+        escape_str(&input, &mut text).unwrap();
+        assert_eq!(text.writes, 3);
+        assert_eq!(text.output, bytes.output);
     }
 
     // ── escape ──────────────────────────────────────────────────────────────
