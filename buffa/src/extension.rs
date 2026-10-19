@@ -1956,9 +1956,7 @@ mod tests {
     #[test]
     fn packed_fixed_width_extenders_append_only_complete_elements() {
         for count in [0usize, 1, 15, 16, 17, 1024] {
-            let words32: Vec<u32> = (0..count)
-                .map(|i| 0xbf80_0000u32 + i as u32)
-                .collect();
+            let words32: Vec<u32> = (0..count).map(|i| 0xbf80_0000u32 + i as u32).collect();
             let mut bytes32 = Vec::with_capacity(count * 4 + 3);
             for &word in &words32 {
                 bytes32.extend_from_slice(&word.to_le_bytes());
