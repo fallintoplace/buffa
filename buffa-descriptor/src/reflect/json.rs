@@ -884,38 +884,15 @@ impl<'de> Visitor<'de> for MessageVisitor<'_> {
                         }
                         seen_oneofs.push(oi);
                     }
-                    // Clear sibling oneof members so a stale member doesn't
-                    // survive in the field map.
-                    let to_clear: Vec<u32> = self
-                        .pool
-                        .message(self.msg_idx)
-                        .oneofs
-                        .get(oi as usize)
-                        .map(|o| {
-                            o.field_indices
-                                .iter()
-                                .filter_map(|&fi| {
-                                    self.pool.message(self.msg_idx).fields.get(fi as usize)
-                                })
-                                .map(|f| f.number)
-                                .filter(|&n| n != number)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    for n in to_clear {
-                        if let Some(fd) = self.pool.message(self.msg_idx).field(n) {
-                            msg.clear(fd);
-                        }
-                    }
                 }
                 // Re-resolve the field by number (the `fd` borrow was
                 // released before `next_value_seed` mutated `msg`). The
                 // declared-field lookup misses extension numbers, so fall
                 // back to the pool's extension index. Membership is proven
                 // by construction here — the field was just resolved from
-                // this message's own pool — and oneof siblings were cleared
-                // above, so insert directly instead of paying `set`'s
-                // re-validation lookup and duplicate oneof sweep per field.
+                // this message's own pool. The fresh message and duplicate
+                // checks guarantee no other member of this oneof is set, so
+                // insert directly without `set`'s repeated sibling sweep.
                 if self.pool.message(self.msg_idx).field(number).is_some()
                     || self.pool.extension_for(self.msg_idx, number).is_some()
                 {

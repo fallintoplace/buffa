@@ -472,6 +472,38 @@ fn json_rejects_duplicate_field_keys() {
 }
 
 #[test]
+fn json_oneof_keeps_one_member_and_rejects_conflicts() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.OneOf").unwrap();
+
+    for (input, number) in [
+        (r#"{"num":42}"#, 1),
+        (r#"{"text":"hello"}"#, 2),
+        (r#"{"msg":{"id":"x","value":5}}"#, 3),
+    ] {
+        let msg = DynamicMessage::from_json(Arc::clone(&p), idx, input).unwrap();
+        assert_eq!(msg.iter_set_fields().count(), 1, "{input}");
+        assert!(msg.field_by_number(number).is_some(), "{input}");
+        let encoded = msg.to_json().unwrap();
+        let roundtrip = DynamicMessage::from_json(Arc::clone(&p), idx, &encoded).unwrap();
+        assert_eq!(msg, roundtrip);
+    }
+
+    assert!(
+        DynamicMessage::from_json(Arc::clone(&p), idx, r#"{"num":42,"text":"bad"}"#).is_err(),
+        "a second non-null oneof member must be rejected"
+    );
+    let after_null =
+        DynamicMessage::from_json(Arc::clone(&p), idx, r#"{"num":null,"text":"ok"}"#).unwrap();
+    assert!(after_null.field_by_number(1).is_none());
+    assert!(after_null.field_by_number(2).is_some());
+    assert!(
+        DynamicMessage::from_json(Arc::clone(&p), idx, r#"{"num":1,"num":2}"#).is_err(),
+        "duplicate field keys must still be rejected"
+    );
+}
+
+#[test]
 fn json_unknown_fields_error_by_default_and_skip_when_lenient() {
     let p = pool();
     let idx = p.message_index("reflect.test.Scalars").unwrap();

@@ -356,8 +356,36 @@ fn benchmark_google_message1(c: &mut Criterion) {
     );
 }
 
+/// Benchmark reflective JSON decoding with scalar, string, and message oneofs.
+fn benchmark_json_oneof(c: &mut Criterion) {
+    let pool = Arc::new(
+        DescriptorPool::decode(include_bytes!(
+            "../../../buffa-descriptor/tests/protos/reflect_test.fds"
+        ))
+        .expect("oneof benchmark schema"),
+    );
+    let idx = pool.message_index("reflect.test.OneOf").unwrap();
+    let mut group = c.benchmark_group("reflect/json_oneof");
+    for (name, json) in [
+        ("scalar", r#"{"num":42}"#),
+        ("string", r#"{"text":"hello"}"#),
+        ("message", r#"{"msg":{"id":"x","value":5}}"#),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                criterion::black_box(
+                    DynamicMessage::from_json(Arc::clone(&pool), idx, criterion::black_box(json))
+                        .expect("parse oneof"),
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    benchmark_json_oneof,
     benchmark_api_response,
     benchmark_log_record,
     benchmark_analytics_event,

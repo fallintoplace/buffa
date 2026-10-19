@@ -1,0 +1,3 @@
+kind: Changed
+body: Skip unnecessary oneof sibling scans and allocations when parsing dynamic JSON messages.
+time: 2026-10-19T15:52:00+02:00
