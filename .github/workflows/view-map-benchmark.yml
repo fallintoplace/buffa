@@ -14,7 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+      - name: Rustfmt
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy -p buffa --all-targets -- -D warnings
+      - name: Full buffa library tests
+        run: cargo test -p buffa --lib
       - name: Validate tiny-map semantics
         run: cargo test -p buffa map_view_iter_unique_tiny_map_equivalence --lib
       - name: Benchmark baseline vs head
+        run: cargo bench -p buffa --bench view_map_unique
+      - name: Repeat A/B measurements
         run: cargo bench -p buffa --bench view_map_unique
