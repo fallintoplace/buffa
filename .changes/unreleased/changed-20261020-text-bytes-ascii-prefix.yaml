@@ -1,0 +1,4 @@
+kind: Changed
+body: |-
+    Textproto bytes encoding now writes long printable ASCII prefixes in one chunk, avoiding per-byte formatter calls while preserving escaping for the rest.
+time: 2026-10-20T21:09:00+02:00
