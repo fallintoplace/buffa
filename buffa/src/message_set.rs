@@ -97,9 +97,18 @@ pub fn merge_item(
                     return Err(DecodeError::UnexpectedEof);
                 }
                 let len = len as usize;
-                let start = message.len();
-                message.resize(start + len, 0);
-                buf.copy_to_slice(&mut message[start..]);
+                // Most MessageSet frames are contiguous. Copy straight into
+                // the output Vec instead of zero-filling the new slots and
+                // overwriting them. Keep the original path for fragmented Buf.
+                let chunk = buf.chunk();
+                if chunk.len() >= len {
+                    message.extend_from_slice(&chunk[..len]);
+                    buf.advance(len);
+                } else {
+                    let start = message.len();
+                    message.resize(start + len, 0);
+                    buf.copy_to_slice(&mut message[start..]);
+                }
             }
             (_, WireType::EndGroup) => {
                 // EndGroup for a different field number — the stream is
@@ -266,6 +275,35 @@ mod tests {
         let (tid, msg) = merge_item_d(&mut body.as_slice(), 50).expect("merge");
         assert_eq!(tid, 9);
         assert_eq!(msg, b"abcd");
+    }
+
+    #[test]
+    fn merge_item_large_contiguous_and_fragmented_payloads() {
+        use bytes::Buf;
+
+        let first = vec![0xa5; 4096];
+        let second = vec![0x5a; 17];
+        let body = item_body(&[
+            &type_id_field(42),
+            &message_field(&first),
+            &message_field(&[]),
+            &message_field(&second),
+            &end_group(),
+        ]);
+        let mut expected = first;
+        expected.extend_from_slice(&second);
+
+        // The split inside the first payload forces the fragmented fallback;
+        // splits at the boundaries also exercise the contiguous fast path.
+        for split in [0, 1, 5, 128, body.len() / 2, body.len() - 1, body.len()] {
+            let limit = core::cell::Cell::new(crate::DEFAULT_UNKNOWN_FIELD_LIMIT);
+            let ctx = crate::DecodeContext::new(crate::RECURSION_LIMIT, &limit);
+            let mut chunks = body[..split].chain(&body[split..]);
+            let (id, decoded) = merge_item(&mut chunks, ctx).unwrap();
+            assert_eq!(id, 42, "split={split}");
+            assert_eq!(decoded, expected, "split={split}");
+            assert_eq!(chunks.remaining(), 0, "split={split}");
+        }
     }
 
     #[test]
