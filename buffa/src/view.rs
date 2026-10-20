@@ -2271,9 +2271,9 @@ impl<'a, K, V> MapView<'a, K, V> {
     /// deduplicate.
     ///
     /// The work happens when this is called, not lazily: it sorts an index
-    /// vector, `O(n log n)` over the wire-entry count regardless of how many
-    /// entries are duplicates, allocating one `Vec<usize>`. Survivors are
-    /// yielded in wire order. A map with at most one entry skips the sort.
+    /// vector, `O(n log n)` above four entries, allocating one
+    /// `Vec<usize>`. Maps of two to four entries use a bounded pairwise
+    /// scan instead of sorting. Survivors are yielded in wire order.
     ///
     /// # Panics
     ///
@@ -2309,10 +2309,9 @@ impl<'a, K, V> MapView<'a, K, V> {
 /// Indices of the last occurrence of each distinct key, in ascending index
 /// order.
 ///
-/// Sorting by `(key, index)` groups equal keys into contiguous runs whose
-/// final element is the last wire occurrence, which is the one last-write-wins
-/// keeps. Compacting those in place and re-sorting by index restores wire
-/// order for the caller.
+/// For at most four entries, scan later keys directly. Larger maps sort
+/// by `(key, index)` to group equal keys into runs whose final entry wins.
+/// Compacting and re-sorting by index restores wire order for the caller.
 ///
 /// Sorting rather than hashing because `K` carries no `Hash` bound, `no_std`
 /// builds have no `HashSet`, and these keys come off the wire — hashing them
@@ -2323,6 +2322,20 @@ fn last_occurrence_indices<K: Ord, V>(entries: &[(K, V)]) -> alloc::vec::Vec<usi
     if n <= 1 {
         // Nothing to deduplicate, and the common tiny-map case skips the sort.
         return (0..n).collect();
+    }
+    if n <= 4 {
+        // Tiny maps are common, and a bounded scan avoids two sorts.
+        // The largest scan makes only six key comparisons.
+        let mut kept = alloc::vec::Vec::with_capacity(n);
+        for i in 0..n {
+            if !entries[i + 1..]
+                .iter()
+                .any(|(key, _)| entries[i].0.cmp(key).is_eq())
+            {
+                kept.push(i);
+            }
+        }
+        return kept;
     }
     let mut order: alloc::vec::Vec<usize> = (0..n).collect();
     order.sort_unstable_by(|&a, &b| entries[a].0.cmp(&entries[b].0).then_with(|| a.cmp(&b)));
@@ -3879,6 +3892,36 @@ mod tests {
         assert_eq!(mv.len_unique(), 8);
         assert_eq!(mv.iter_unique().len(), 8, "exact size hint");
         assert_eq!(mv.len(), 32, "iter() still sees every wire entry");
+    }
+
+    #[test]
+    fn map_view_iter_unique_tiny_map_equivalence() {
+        // Include maps on both sides of the four-entry fast-path threshold.
+        // Different key strides exercise wire order and last-write-wins.
+        for count in 0..=6u32 {
+            for distinct in 1..=6u32 {
+                for stride in [1, 3, 5] {
+                    let entries: alloc::vec::Vec<(u32, u32)> = (0..count)
+                        .map(|i| (((i * stride + 1) % distinct), i))
+                        .collect();
+                    let map = MapView::new(entries.clone());
+                    let expected: alloc::vec::Vec<(u32, u32)> = entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, (key, _))| {
+                            !entries[i + 1..].iter().any(|(later, _)| later == key)
+                        })
+                        .map(|(_, entry)| *entry)
+                        .collect();
+                    assert_eq!(
+                        map.iter_unique().copied().collect::<alloc::vec::Vec<_>>(),
+                        expected,
+                        "count={count}, distinct={distinct}, stride={stride}"
+                    );
+                    assert_eq!(map.len_unique(), expected.len());
+                }
+            }
+        }
     }
 
     #[test]
