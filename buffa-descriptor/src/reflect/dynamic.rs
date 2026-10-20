@@ -748,53 +748,53 @@ impl DynamicMessage {
             let mut key: Option<MapKey> = None;
             let mut value: Option<Value> = None;
             while entry.has_remaining() {
-            let entry_tag = Tag::decode(&mut entry)?;
-            match entry_tag.field_number() {
-                1 => {
-                    // Key and value tags must carry the wire type of the
-                    // declared type, as in the owned map codec. That includes a
-                    // message value, which unlike an ordinary message field
-                    // cannot use the legacy group encoding.
-                    check_wire_type(entry_tag, map_key_wire_type(key_ty))?;
-                    key = Some(decode_map_key(key_ty, entry_tag, &mut entry)?);
-                }
-                2 => {
-                    check_wire_type(entry_tag, singular_wire_type(value_kind, false))?;
-                    // No `descend()` for the entry itself. A message-typed
-                    // value descends once inside `decode_element_no_alias`,
-                    // and that single level is what the owned decoder
-                    // (`map_codec`) and the view decoder each spend on a
-                    // message-valued map entry. Charging a second one here
-                    // would make this decoder reject map nesting the other
-                    // two accept, which the infallible
-                    // `ReflectMessage::to_dynamic` cannot report.
-                    match &mut value {
-                        // Proto merge semantics, as in the owned map codec: a
-                        // repeated message value within one entry merges into
-                        // the message decoded so far rather than replacing it.
-                        // (Only reachable for a message-kind value — the kind
-                        // is fixed per field.) The `descend` here mirrors the
-                        // one inside `decode_element_no_alias`, so every
-                        // occurrence decodes at the same depth.
-                        Some(Value::Message(existing)) => {
-                            Self::merge_message_wire(
-                                existing,
-                                entry_tag,
-                                &mut entry,
-                                ctx.descend()?,
-                            )?;
-                        }
-                        // First occurrence, or any scalar/enum value (last wins).
-                        _ => {
-                            value =
-                                Some(self.decode_element_no_alias(
-                                    value_kind, entry_tag, &mut entry, ctx,
-                                )?);
+                let entry_tag = Tag::decode(&mut entry)?;
+                match entry_tag.field_number() {
+                    1 => {
+                        // Key and value tags must carry the wire type of the
+                        // declared type, as in the owned map codec. That includes a
+                        // message value, which unlike an ordinary message field
+                        // cannot use the legacy group encoding.
+                        check_wire_type(entry_tag, map_key_wire_type(key_ty))?;
+                        key = Some(decode_map_key(key_ty, entry_tag, &mut entry)?);
+                    }
+                    2 => {
+                        check_wire_type(entry_tag, singular_wire_type(value_kind, false))?;
+                        // No `descend()` for the entry itself. A message-typed
+                        // value descends once inside `decode_element_no_alias`,
+                        // and that single level is what the owned decoder
+                        // (`map_codec`) and the view decoder each spend on a
+                        // message-valued map entry. Charging a second one here
+                        // would make this decoder reject map nesting the other
+                        // two accept, which the infallible
+                        // `ReflectMessage::to_dynamic` cannot report.
+                        match &mut value {
+                            // Proto merge semantics, as in the owned map codec: a
+                            // repeated message value within one entry merges into
+                            // the message decoded so far rather than replacing it.
+                            // (Only reachable for a message-kind value — the kind
+                            // is fixed per field.) The `descend` here mirrors the
+                            // one inside `decode_element_no_alias`, so every
+                            // occurrence decodes at the same depth.
+                            Some(Value::Message(existing)) => {
+                                Self::merge_message_wire(
+                                    existing,
+                                    entry_tag,
+                                    &mut entry,
+                                    ctx.descend()?,
+                                )?;
+                            }
+                            // First occurrence, or any scalar/enum value (last wins).
+                            _ => {
+                                value =
+                                    Some(self.decode_element_no_alias(
+                                        value_kind, entry_tag, &mut entry, ctx,
+                                    )?);
+                            }
                         }
                     }
+                    _ => skip_field_depth(entry_tag, &mut entry, ctx.depth())?,
                 }
-                _ => skip_field_depth(entry_tag, &mut entry, ctx.depth())?,
-            }
             }
             Ok((key, value))
         })?;
@@ -839,25 +839,25 @@ impl DynamicMessage {
             let mut value: Option<Value> = None;
             let mut value_unknown = false;
             while entry_buf.has_remaining() {
-            let entry_tag = Tag::decode(&mut entry_buf)?;
-            match entry_tag.field_number() {
-                1 => {
-                    check_wire_type(entry_tag, map_key_wire_type(key_ty))?;
-                    key = Some(decode_map_key(key_ty, entry_tag, &mut entry_buf)?);
-                }
-                2 => {
-                    check_wire_type(entry_tag, WireType::Varint)?;
-                    let raw = decode_int32(&mut entry_buf)?;
-                    if self.enum_value_is_known(eidx, Some(EnumType::Closed), raw) {
-                        value = Some(Value::EnumNumber(raw));
-                        value_unknown = false;
-                    } else {
-                        value = None;
-                        value_unknown = true;
+                let entry_tag = Tag::decode(&mut entry_buf)?;
+                match entry_tag.field_number() {
+                    1 => {
+                        check_wire_type(entry_tag, map_key_wire_type(key_ty))?;
+                        key = Some(decode_map_key(key_ty, entry_tag, &mut entry_buf)?);
                     }
+                    2 => {
+                        check_wire_type(entry_tag, WireType::Varint)?;
+                        let raw = decode_int32(&mut entry_buf)?;
+                        if self.enum_value_is_known(eidx, Some(EnumType::Closed), raw) {
+                            value = Some(Value::EnumNumber(raw));
+                            value_unknown = false;
+                        } else {
+                            value = None;
+                            value_unknown = true;
+                        }
+                    }
+                    _ => skip_field_depth(entry_tag, &mut entry_buf, ctx.depth())?,
                 }
-                _ => skip_field_depth(entry_tag, &mut entry_buf, ctx.depth())?,
-            }
             }
             let unknown_entry = value_unknown.then(|| entry.to_vec());
             Ok((key, value, unknown_entry))
@@ -2869,7 +2869,6 @@ mod tests {
     // `tests/dynamic_e2e.rs`, and the shared guard's own boundary in
     // `buffa::message`).
 
-
     /// A contiguous `Buf` that refuses any transient copy. Scalar/string
     /// values are decoded from borrowed sub-slices rather than through this
     /// buffer's `copy_to_bytes`.
@@ -2916,10 +2915,12 @@ mod tests {
         let budget = core::cell::Cell::new(100);
         let mut input = NoPayloadCopy(&wire);
         let mut decoded = DynamicMessage::new(Arc::clone(&pool), idx);
-        decoded.merge_buf(
-            &mut input,
-            buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &budget),
-        ).unwrap();
+        decoded
+            .merge_buf(
+                &mut input,
+                buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &budget),
+            )
+            .unwrap();
         assert_eq!(input.remaining(), 0);
         let expected = DynamicMessage::decode(pool, idx, &wire).unwrap();
         assert_eq!(decoded, expected);
@@ -2972,13 +2973,15 @@ mod tests {
         let wire = [0x0a, 0x03, 1, 2, 3, 0x2a, 0x02, 0x10, 9];
         let expected = DynamicMessage::decode(Arc::clone(&pool), idx, &wire).unwrap();
         for split in 1..wire.len() {
-            let mut input = wire[..split].chain(&wire[split..]);
+            let mut input = (&wire[..split]).chain(&wire[split..]);
             let budget = core::cell::Cell::new(100);
             let mut decoded = DynamicMessage::new(Arc::clone(&pool), idx);
-            decoded.merge_buf(
-                &mut input,
-                buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &budget),
-            ).unwrap();
+            decoded
+                .merge_buf(
+                    &mut input,
+                    buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &budget),
+                )
+                .unwrap();
             assert_eq!(input.remaining(), 0, "split at {split}");
             assert_eq!(decoded, expected, "split at {split}");
         }
