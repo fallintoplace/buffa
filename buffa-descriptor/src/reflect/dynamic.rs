@@ -124,6 +124,29 @@ impl PartialEq for DynamicMessage {
     }
 }
 
+/// Decode a length-delimited payload directly from a contiguous buffer.
+///
+/// The caller must verify `buf.remaining() >= len` first. Consume the entire
+/// payload even if decoding fails, matching `Buf::copy_to_bytes` behavior.
+/// Decode through `&[u8]` rather than nested `Buf::take` wrappers: message
+/// recursion must not create unbounded generic buffer types.
+#[inline]
+fn with_payload<R>(
+    buf: &mut impl Buf,
+    len: usize,
+    decode: impl FnOnce(&[u8]) -> Result<R, DecodeError>,
+) -> Result<R, DecodeError> {
+    debug_assert!(buf.remaining() >= len);
+    if buf.chunk().len() >= len {
+        let result = decode(&buf.chunk()[..len]);
+        buf.advance(len);
+        result
+    } else {
+        let payload = buf.copy_to_bytes(len);
+        decode(&payload)
+    }
+}
+
 impl DynamicMessage {
     /// Create an empty dynamic message for the given message type.
     #[must_use]
@@ -535,8 +558,10 @@ impl DynamicMessage {
                 if buf.remaining() < len {
                     return Err(DecodeError::UnexpectedEof);
                 }
-                let mut sub = buf.copy_to_bytes(len);
-                existing.merge_buf(&mut sub, ctx)
+                with_payload(buf, len, |payload| {
+                    let mut sub = payload;
+                    existing.merge_buf(&mut sub, ctx)
+                })
             }
             WireType::StartGroup => existing.merge_group(buf, tag.field_number(), ctx),
             wt => Err(DecodeError::WireTypeMismatch {
@@ -605,15 +630,17 @@ impl DynamicMessage {
                 list.reserve(additional);
             }
             // Take a sub-buffer of `len` bytes and decode elements from it.
-            let mut packed = buf.copy_to_bytes(len);
-            while packed.has_remaining() {
-                // Charged, unlike the generated decoder: that exemption is
-                // sized for a `Vec<i32>`, and this store is a `Vec<Value>`.
-                // See `DecodeContext::register_element_memory`.
-                ctx.register_element_memory(core::mem::size_of::<Value>())?;
-                list.push(decode_packed_element(elem, number, &mut packed)?);
-            }
-            return Ok(());
+            return with_payload(buf, len, |payload| {
+                let mut packed = payload;
+                while packed.has_remaining() {
+                    // Charged, unlike the generated decoder: that exemption is
+                    // sized for a `Vec<i32>`, and this store is a `Vec<Value>`.
+                    // See `DecodeContext::register_element_memory`.
+                    ctx.register_element_memory(core::mem::size_of::<Value>())?;
+                    list.push(decode_packed_element(elem, number, &mut packed)?);
+                }
+                Ok(())
+            });
         }
         // Unpacked: decode one element. We need to be careful not to alias
         // self.pool and self.fields, so for nested messages we collect what
@@ -647,18 +674,21 @@ impl DynamicMessage {
             if buf.remaining() < len {
                 return Err(DecodeError::UnexpectedEof);
             }
-            let mut packed = buf.copy_to_bytes(len);
-            while packed.has_remaining() {
-                let raw = decode_int32(&mut packed)?;
-                if self.enum_value_is_known(eidx, Some(EnumType::Closed), raw) {
-                    // Same charge `merge_list_field` applies; this is a
-                    // parallel implementation of the same work.
-                    ctx.register_element_memory(core::mem::size_of::<Value>())?;
-                    self.push_closed_enum_list_value(number, raw);
-                } else {
-                    self.record_unknown_enum(number, raw, ctx)?;
+            with_payload(buf, len, |payload| {
+                let mut packed = payload;
+                while packed.has_remaining() {
+                    let raw = decode_int32(&mut packed)?;
+                    if self.enum_value_is_known(eidx, Some(EnumType::Closed), raw) {
+                        // Same charge `merge_list_field` applies; this is a
+                        // parallel implementation of the same work.
+                        ctx.register_element_memory(core::mem::size_of::<Value>())?;
+                        self.push_closed_enum_list_value(number, raw);
+                    } else {
+                        self.record_unknown_enum(number, raw, ctx)?;
+                    }
                 }
-            }
+                Ok(())
+            })?;
         } else {
             let raw = decode_int32(buf)?;
             if self.enum_value_is_known(eidx, Some(EnumType::Closed), raw) {
@@ -713,10 +743,11 @@ impl DynamicMessage {
         if buf.remaining() < len {
             return Err(DecodeError::UnexpectedEof);
         }
-        let mut entry = buf.copy_to_bytes(len);
-        let mut key: Option<MapKey> = None;
-        let mut value: Option<Value> = None;
-        while entry.has_remaining() {
+        let (key, value) = with_payload(buf, len, |payload| {
+            let mut entry = payload;
+            let mut key: Option<MapKey> = None;
+            let mut value: Option<Value> = None;
+            while entry.has_remaining() {
             let entry_tag = Tag::decode(&mut entry)?;
             match entry_tag.field_number() {
                 1 => {
@@ -764,7 +795,9 @@ impl DynamicMessage {
                 }
                 _ => skip_field_depth(entry_tag, &mut entry, ctx.depth())?,
             }
-        }
+            }
+            Ok((key, value))
+        })?;
         let k = key.unwrap_or_else(|| default_map_key(key_ty));
         let v = value.unwrap_or_else(|| default_value(value_kind, &self.pool));
         ctx.register_element_memory(
@@ -800,12 +833,12 @@ impl DynamicMessage {
         if buf.remaining() < len {
             return Err(DecodeError::UnexpectedEof);
         }
-        let entry = buf.copy_to_bytes(len);
-        let mut entry_buf = entry.clone();
-        let mut key: Option<MapKey> = None;
-        let mut value: Option<Value> = None;
-        let mut value_unknown = false;
-        while entry_buf.has_remaining() {
+        let (key, value, unknown_entry) = with_payload(buf, len, |entry| {
+            let mut entry_buf = entry;
+            let mut key: Option<MapKey> = None;
+            let mut value: Option<Value> = None;
+            let mut value_unknown = false;
+            while entry_buf.has_remaining() {
             let entry_tag = Tag::decode(&mut entry_buf)?;
             match entry_tag.field_number() {
                 1 => {
@@ -825,13 +858,12 @@ impl DynamicMessage {
                 }
                 _ => skip_field_depth(entry_tag, &mut entry_buf, ctx.depth())?,
             }
-        }
-        if value_unknown {
-            self.record_unknown(
-                number,
-                UnknownFieldData::LengthDelimited(entry.to_vec()),
-                ctx,
-            )?;
+            }
+            let unknown_entry = value_unknown.then(|| entry.to_vec());
+            Ok((key, value, unknown_entry))
+        })?;
+        if let Some(entry) = unknown_entry {
+            self.record_unknown(number, UnknownFieldData::LengthDelimited(entry), ctx)?;
             return Ok(());
         }
         let k = key.unwrap_or_else(|| default_map_key(key_ty));
@@ -910,8 +942,10 @@ impl DynamicMessage {
                 if buf.remaining() < len {
                     return Err(DecodeError::UnexpectedEof);
                 }
-                let mut sub = buf.copy_to_bytes(len);
-                nested.merge_buf(&mut sub, ctx)
+                with_payload(buf, len, |payload| {
+                    let mut sub = payload;
+                    nested.merge_buf(&mut sub, ctx)
+                })
             }
             WireType::StartGroup => nested.merge_group(buf, tag.field_number(), ctx),
             _ => Err(DecodeError::WireTypeMismatch {
@@ -2834,6 +2868,121 @@ mod tests {
     // tested directly (the e2e encode paths are covered in
     // `tests/dynamic_e2e.rs`, and the shared guard's own boundary in
     // `buffa::message`).
+
+
+    /// A contiguous `Buf` that refuses any transient copy. Scalar/string
+    /// values are decoded from borrowed sub-slices rather than through this
+    /// buffer's `copy_to_bytes`.
+    struct NoPayloadCopy<'a>(&'a [u8]);
+
+    impl buffa::bytes::Buf for NoPayloadCopy<'_> {
+        fn remaining(&self) -> usize {
+            self.0.len()
+        }
+
+        fn chunk(&self) -> &[u8] {
+            self.0
+        }
+
+        fn advance(&mut self, count: usize) {
+            self.0 = &self.0[count..];
+        }
+
+        fn copy_to_bytes(&mut self, _len: usize) -> buffa::bytes::Bytes {
+            panic!("contiguous reflective payload must not be copied");
+        }
+    }
+
+    #[test]
+    fn contiguous_reflect_payloads_are_decoded_without_copying() {
+        use alloc::sync::Arc;
+        use buffa::bytes::Buf;
+
+        use crate::DescriptorPool;
+
+        let pool = Arc::new(
+            DescriptorPool::decode(include_bytes!("../../tests/protos/reflect_test.fds")).unwrap(),
+        );
+        let idx = pool.message_index("reflect.test.Containers").unwrap();
+        // Packed ints, a map entry, two occurrences of one nested message,
+        // and a repeated message. The second nested occurrence merges.
+        let wire = [
+            0x0a, 0x03, 1, 2, 3,
+            0x1a, 0x05, 0x0a, 0x01, b'a', 0x10, 7,
+            0x2a, 0x02, 0x10, 9,
+            0x2a, 0x02, 0x10, 10,
+            0x42, 0x02, 0x10, 11,
+        ];
+        let budget = core::cell::Cell::new(100);
+        let mut input = NoPayloadCopy(&wire);
+        let mut decoded = DynamicMessage::new(Arc::clone(&pool), idx);
+        decoded.merge_buf(
+            &mut input,
+            buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &budget),
+        ).unwrap();
+        assert_eq!(input.remaining(), 0);
+        let expected = DynamicMessage::decode(pool, idx, &wire).unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn failed_contiguous_payloads_consume_the_field_but_not_following_fields() {
+        use alloc::sync::Arc;
+        use buffa::bytes::Buf;
+
+        use crate::DescriptorPool;
+
+        let pool = Arc::new(
+            DescriptorPool::decode(include_bytes!("../../tests/protos/reflect_test.fds")).unwrap(),
+        );
+        let idx = pool.message_index("reflect.test.Containers").unwrap();
+        const TAIL: &[u8] = &[0x30, 0x01];
+        // Unterminated packed varint, nested scalar, and truncated map key.
+        let wires: [&[u8]; 3] = [
+            &[0x0a, 0x03, 0x01, 0x80, 0x80, 0x30, 0x01],
+            &[0x2a, 0x02, 0x10, 0x80, 0x30, 0x01],
+            &[0x1a, 0x03, 0x0a, 0x02, b'a', 0x30, 0x01],
+        ];
+        for wire in wires {
+            let budget = core::cell::Cell::new(100);
+            let mut input = NoPayloadCopy(wire);
+            let mut decoded = DynamicMessage::new(Arc::clone(&pool), idx);
+            assert_eq!(
+                decoded.merge_buf(
+                    &mut input,
+                    buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &budget),
+                ),
+                Err(buffa::DecodeError::UnexpectedEof),
+            );
+            assert_eq!(input.chunk(), TAIL);
+        }
+    }
+
+    #[test]
+    fn fragmented_reflect_payloads_still_decode() {
+        use alloc::sync::Arc;
+        use buffa::bytes::Buf;
+
+        use crate::DescriptorPool;
+
+        let pool = Arc::new(
+            DescriptorPool::decode(include_bytes!("../../tests/protos/reflect_test.fds")).unwrap(),
+        );
+        let idx = pool.message_index("reflect.test.Containers").unwrap();
+        let wire = [0x0a, 0x03, 1, 2, 3, 0x2a, 0x02, 0x10, 9];
+        let expected = DynamicMessage::decode(Arc::clone(&pool), idx, &wire).unwrap();
+        for split in 1..wire.len() {
+            let mut input = wire[..split].chain(&wire[split..]);
+            let budget = core::cell::Cell::new(100);
+            let mut decoded = DynamicMessage::new(Arc::clone(&pool), idx);
+            decoded.merge_buf(
+                &mut input,
+                buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &budget),
+            ).unwrap();
+            assert_eq!(input.remaining(), 0, "split at {split}");
+            assert_eq!(decoded, expected, "split at {split}");
+        }
+    }
 
     #[test]
     fn checked_encode_size_boundary() {
