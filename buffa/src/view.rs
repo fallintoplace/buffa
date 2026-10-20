@@ -2381,18 +2381,19 @@ impl<'a, K, V> IntoIterator for MapView<'a, K, V> {
 }
 
 /// One unknown-field wire record: either a span borrowed from the input
-/// buffer, or synthetic bytes for a value with no borrowable source span.
+/// buffer, or an inline-encoded synthetic varint.
 #[derive(Clone, Debug)]
 enum UnknownFieldsViewRecord<'a> {
     Borrowed(&'a [u8]),
-    Owned(alloc::vec::Vec<u8>),
+    // A field-number tag occupies at most 5 bytes; a u64 varint at most 10.
+    InlineVarint { bytes: [u8; 15], len: u8 },
 }
 
 impl UnknownFieldsViewRecord<'_> {
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Borrowed(span) => span,
-            Self::Owned(bytes) => bytes,
+            Self::InlineVarint { bytes, len } => &bytes[..usize::from(*len)],
         }
     }
 }
@@ -2571,9 +2572,8 @@ impl<'a> UnknownFieldsView<'a> {
     /// Marked `#[cold]`: the sole caller is the per-element route for a closed
     /// enum whose wire value names no variant — reached from a *recognized*
     /// field, including inside a packed element loop, so it can run more than
-    /// once per message against a newer producer's data. It builds a `Vec` per
-    /// value regardless, which dwarfs what the size-optimized body this
-    /// attribute asks for costs.
+    /// once per message against a newer producer's data. Keeping this
+    /// path cold avoids growing the hot decode loop.
     #[doc(hidden)]
     #[cold]
     pub fn push_varint(
@@ -2588,10 +2588,15 @@ impl<'a> UnknownFieldsView<'a> {
         let st = self.state_mut();
         st.to_owned_budget = st.to_owned_budget.saturating_add(1);
 
-        let mut bytes = alloc::vec::Vec::new();
-        Tag::new(field_number, WireType::Varint).encode(&mut bytes);
-        encode_varint(value, &mut bytes);
-        st.records.push(UnknownFieldsViewRecord::Owned(bytes));
+        // A valid tag (up to 5 bytes) and a u64 varint (up to 10 bytes)
+        // always fit in the record itself, without allocating a separate Vec.
+        let mut bytes = [0u8; 15];
+        let mut dst: &mut [u8] = &mut bytes;
+        Tag::new(field_number, WireType::Varint).encode(&mut dst);
+        encode_varint(value, &mut dst);
+        let len = (15 - dst.len()) as u8;
+        st.records
+            .push(UnknownFieldsViewRecord::InlineVarint { bytes, len });
         // Synthetic bytes have no position in the input buffer, so a later
         // borrowed record must start a fresh span.
         st.last_tail = None;
@@ -4074,6 +4079,90 @@ mod tests {
             fields[0].data,
             crate::UnknownFieldData::Varint(99)
         ));
+    }
+
+    #[test]
+    fn unknown_fields_view_synthetic_varints_fit_inline() {
+        use crate::encoding::{encode_varint, Tag, WireType};
+
+        let numbers = [1, 15, 16, 1 << 20, (1 << 29) - 1];
+        let values = [0, 127, 128, u32::MAX as u64, u64::MAX];
+        let ctx = record_ctx(numbers.len() * values.len());
+        let mut view = UnknownFieldsView::new();
+        let mut expected = Vec::new();
+
+        for &number in &numbers {
+            for &value in &values {
+                view.push_varint(number, value, ctx).unwrap();
+
+                let record = view.records_slice().last().unwrap();
+                assert!(matches!(
+                    record,
+                    UnknownFieldsViewRecord::InlineVarint { .. }
+                ));
+                let mut wire = Vec::new();
+                Tag::new(number, WireType::Varint).encode(&mut wire);
+                encode_varint(value, &mut wire);
+                assert_eq!(record.as_slice(), wire.as_slice());
+                expected.extend_from_slice(&wire);
+            }
+        }
+
+        assert_eq!(ctx.remaining_unknown_fields(), 0);
+        assert_eq!(view.encoded_len(), expected.len());
+        let mut encoded = Vec::new();
+        view.write_to(&mut encoded);
+        assert_eq!(encoded, expected);
+
+        // Clone and owned conversion must see the same wire bytes, including
+        // the 15-byte maximum-length record.
+        let mut cloned_bytes = Vec::new();
+        view.clone().write_to(&mut cloned_bytes);
+        assert_eq!(cloned_bytes, expected);
+        let owned = view.to_owned().unwrap();
+        assert_eq!(owned.len(), numbers.len() * values.len());
+        let mut fields = owned.iter();
+        for &number in &numbers {
+            for &value in &values {
+                let field = fields.next().unwrap();
+                assert_eq!(field.number, number);
+                assert_eq!(field.data, crate::UnknownFieldData::Varint(value));
+            }
+        }
+        assert!(fields.next().is_none());
+        assert_eq!(view.records_slice().last().unwrap().as_slice().len(), 15);
+    }
+
+    #[test]
+    fn unknown_fields_view_mixed_borrowed_and_inline_records_keep_order() {
+        let ctx = record_ctx(3);
+        let first: &[u8] = &[0x08, 0x07];
+        let last: &[u8] = &[0x10, 0x09];
+        let mut view = UnknownFieldsView::new();
+        view.push_record(first, first.len(), ctx).unwrap();
+        view.push_varint(3, u64::MAX, ctx).unwrap();
+        view.push_record(last, last.len(), ctx).unwrap();
+
+        assert_eq!(view.records_slice().len(), 3);
+        assert_eq!(ctx.remaining_unknown_fields(), 0);
+        let mut encoded = Vec::new();
+        view.write_to(&mut encoded);
+        let owned = view.to_owned().unwrap();
+        assert_eq!(owned.len(), 3);
+        assert_eq!(owned.iter().map(|f| f.number).collect::<Vec<_>>(), [1, 3, 2]);
+
+        let mut expected = first.to_vec();
+        crate::encoding::Tag::new(3, crate::encoding::WireType::Varint)
+            .encode(&mut expected);
+        crate::encoding::encode_varint(u64::MAX, &mut expected);
+        expected.extend_from_slice(last);
+        assert_eq!(encoded, expected);
+        assert_eq!(view.encoded_len(), encoded.len());
+        assert_eq!(
+            view.push_varint(4, 1, ctx),
+            Err(crate::DecodeError::UnknownFieldLimitExceeded)
+        );
+        assert_eq!(view.records_slice().len(), 3);
     }
 
     // ── OwnedView ──────────────────────────────────────────────────────
