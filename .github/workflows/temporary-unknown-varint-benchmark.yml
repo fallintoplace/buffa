@@ -1,0 +1,37 @@
+name: Temporary unknown varint benchmark
+
+on:
+  push:
+    branches:
+      - perf/skip-unknown-varints-20261020-2158
+
+jobs:
+  bench:
+    if: github.repository == 'fallintoplace/buffa'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Compare baseline and optimized varint skipping
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/buffa-baseline" e81155072aa84941410985395c75c6c4550dab24
+          mkdir -p "$RUNNER_TEMP/buffa-baseline/buffa/tests"
+          cp buffa/tests/perf_skip_varint.rs "$RUNNER_TEMP/buffa-baseline/buffa/tests/perf_skip_varint.rs"
+          for ref in baseline optimized optimized baseline; do
+            echo "========== $ref =========="
+            if [ "$ref" = baseline ]; then
+              root="$RUNNER_TEMP/buffa-baseline"
+            else
+              root="$GITHUB_WORKSPACE"
+            fi
+            (
+              cd "$root"
+              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo test --release --locked -p buffa --test perf_skip_varint -- --ignored --nocapture
+            )
+          done

@@ -586,6 +586,31 @@ pub fn wire_type_mismatch(tag: Tag, expected: WireType) -> DecodeError {
     }
 }
 
+/// Skip an unknown varint without assembling its value.
+///
+/// Contiguous buffers take a fast path that looks only for the terminator.
+/// The tenth byte must still fit in one bit, matching `decode_varint`.
+/// Fragmented and truncated values use the existing decoder for identical
+/// error handling.
+#[inline]
+fn skip_varint(buf: &mut impl Buf) -> Result<(), DecodeError> {
+    let chunk = buf.chunk();
+    for (idx, &byte) in chunk.iter().take(10).enumerate() {
+        if idx == 9 {
+            if byte > 1 {
+                return Err(DecodeError::VarintTooLong);
+            }
+            buf.advance(10);
+            return Ok(());
+        }
+        if byte < 0x80 {
+            buf.advance(idx + 1);
+            return Ok(());
+        }
+    }
+    decode_varint(buf).map(|_| ())
+}
+
 /// Skip a field's payload, with an explicit recursion depth budget for groups.
 ///
 /// Generated code must call this (not [`skip_field`]) when a decode context
@@ -606,7 +631,7 @@ pub fn wire_type_mismatch(tag: Tag, expected: WireType) -> DecodeError {
 pub fn skip_field_depth(tag: Tag, buf: &mut impl Buf, depth: u32) -> Result<(), DecodeError> {
     match tag.wire_type() {
         WireType::Varint => {
-            decode_varint(buf)?;
+            skip_varint(buf)?;
         }
         WireType::Fixed64 => {
             if buf.remaining() < 8 {
@@ -812,6 +837,42 @@ pub fn decode_unknown_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn skip_varint_matches_decoder_on_contiguous_and_fragmented_buffers() {
+        use bytes::Buf;
+
+        let cases: &[&[u8]] = &[
+            &[0x00, 0xaa],
+            &[0x7f, 0xaa],
+            &[0x80, 0x01, 0xaa],
+            &[0xff, 0xff, 0xff, 0xff, 0x0f, 0xaa],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0xaa],
+            &[0x80], // truncated
+            &[0xff, 0xff, 0xff], // truncated
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80],
+            &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00],
+        ];
+
+        let tag = Tag::new(1, WireType::Varint);
+        for &input in cases {
+            for split in 0..=input.len() {
+                let mut expected = input[..split].chain(&input[split..]);
+                let mut actual = input[..split].chain(&input[split..]);
+                let decoded = decode_varint(&mut expected).map(|_| ());
+                let skipped = skip_field_depth(tag, &mut actual, crate::RECURSION_LIMIT);
+                assert_eq!(skipped, decoded, "input={input:?}, split={split}");
+                if decoded.is_ok() {
+                    assert_eq!(
+                        actual.remaining(),
+                        expected.remaining(),
+                        "input={input:?}, split={split}"
+                    );
+                }
+            }
+        }
+    }
+
 
     #[test]
     fn test_check_wire_type_match() {
