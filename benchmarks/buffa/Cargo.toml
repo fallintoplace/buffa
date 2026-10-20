@@ -40,6 +40,8 @@ reflect = []
 lazy = []
 # `iso` gates the per-message isolated targets out of the default `task bench` run.
 iso = []
+# Opt-in ordered-map deduplication benchmark, outside the standard baselines.
+map_view_iter = []
 # `encode_sink` gates the sink-comparison bench (`task bench-encode-sink`) out of
 # the default run for the same reason: its IDs must not enter saved baselines.
 encode_sink = []
@@ -119,6 +121,11 @@ inherits = "release"
 name = "column_batch"
 harness = false
 required-features = ["iso", "column_batch"]
+
+[[bench]]
+name = "map_view_iter"
+harness = false
+required-features = ["map_view_iter"]
 
 [[bench]]
 name = "encode_sink"

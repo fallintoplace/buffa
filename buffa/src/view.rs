@@ -2270,10 +2270,10 @@ impl<'a, K, V> MapView<'a, K, V> {
     /// (including malformed duplicates), so the JSON encode path must
     /// deduplicate.
     ///
-    /// The work happens when this is called, not lazily: it sorts an index
-    /// vector, `O(n log n)` over the wire-entry count regardless of how many
-    /// entries are duplicates, allocating one `Vec<usize>`. Survivors are
-    /// yielded in wire order. A map with at most one entry skips the sort.
+    /// The work happens when this is called, not lazily. Entries already in
+    /// key order take an `O(n)` scan; other inputs sort indexes in
+    /// `O(n log n)`. Both allocate a `Vec<usize>` and preserve the wire order
+    /// of surviving entries. A map with at most one entry skips the sort.
     ///
     /// # Panics
     ///
@@ -2309,10 +2309,10 @@ impl<'a, K, V> MapView<'a, K, V> {
 /// Indices of the last occurrence of each distinct key, in ascending index
 /// order.
 ///
-/// Sorting by `(key, index)` groups equal keys into contiguous runs whose
-/// final element is the last wire occurrence, which is the one last-write-wins
-/// keeps. Compacting those in place and re-sorting by index restores wire
-/// order for the caller.
+/// For key-ordered entries, scan equal-key runs directly and keep each run's
+/// final index. Otherwise, sorting by `(key, index)` groups equal keys whose
+/// last index is the last wire occurrence. Compacting those runs and sorting
+/// the survivors by index restores wire order for the caller.
 ///
 /// Sorting rather than hashing because `K` carries no `Hash` bound, `no_std`
 /// builds have no `HashSet`, and these keys come off the wire — hashing them
@@ -2324,7 +2324,29 @@ fn last_occurrence_indices<K: Ord, V>(entries: &[(K, V)]) -> alloc::vec::Vec<usi
         // Nothing to deduplicate, and the common tiny-map case skips the sort.
         return (0..n).collect();
     }
-    let mut order: alloc::vec::Vec<usize> = (0..n).collect();
+    // Encoders backed by ordered maps emit keys in nondecreasing order.
+    // The final index of each equal-key run is already in wire order.
+    let mut order = alloc::vec::Vec::with_capacity(n);
+    let mut ordered = true;
+    for i in 1..n {
+        match entries[i - 1].0.cmp(&entries[i].0) {
+            core::cmp::Ordering::Less => order.push(i - 1),
+            core::cmp::Ordering::Equal => {}
+            core::cmp::Ordering::Greater => {
+                ordered = false;
+                break;
+            }
+        }
+    }
+    if ordered {
+        order.push(n - 1);
+        return order;
+    }
+
+    // The input is not key-ordered. Rebuild the full index list and keep the
+    // stable last-write-wins behavior for arbitrary wire order.
+    order.clear();
+    order.extend(0..n);
     order.sort_unstable_by(|&a, &b| entries[a].0.cmp(&entries[b].0).then_with(|| a.cmp(&b)));
     let mut kept = 0usize;
     for r in 0..n {
@@ -3830,6 +3852,40 @@ mod tests {
     }
 
     #[test]
+    fn map_view_iter_unique_ordered_duplicate_runs() {
+        let mv = MapView::new(alloc::vec![
+            (1, 10),
+            (1, 11),
+            (2, 20),
+            (2, 21),
+            (2, 22),
+            (4, 40),
+        ]);
+        assert_eq!(
+            mv.iter_unique().copied().collect::<alloc::vec::Vec<_>>(),
+            [(1, 11), (2, 22), (4, 40)]
+        );
+        assert_eq!(mv.iter_unique().len(), 3);
+    }
+
+    #[test]
+    fn map_view_iter_unique_falls_back_after_late_inversion() {
+        let mv = MapView::new(alloc::vec![
+            (1, 10),
+            (1, 11),
+            (2, 20),
+            (2, 21),
+            (0, 0),
+            (1, 12),
+            (3, 30),
+        ]);
+        assert_eq!(
+            mv.iter_unique().copied().collect::<alloc::vec::Vec<_>>(),
+            [(2, 21), (0, 0), (1, 12), (3, 30)]
+        );
+    }
+
+    #[test]
     fn map_view_iter_unique_is_not_quadratic_on_distinct_keys() {
         use core::sync::atomic::Ordering;
 
@@ -3846,14 +3902,12 @@ mod tests {
         let cmps = CMPS.load(Ordering::Relaxed);
 
         assert_eq!(seen, N as usize, "every distinct key survives");
-        // n log2 n is ~49k here; the pairwise scan would be ~8.4M. Two orders
-        // of magnitude apart, so this bound is loose enough not to be brittle
-        // and tight enough that a return to quadratic cannot slip past.
-        let budget = 100 * N as usize;
-        assert!(
-            cmps < budget,
-            "dedup of {N} distinct keys took {cmps} comparisons, over the {budget} budget — \
-             this is the quadratic regression guard"
+        // Ordered distinct keys require exactly one comparison per adjacent
+        // pair; the sort fallback would make additional comparisons.
+        assert_eq!(
+            cmps,
+            N as usize - 1,
+            "ordered map should use the linear scan, without sorting indexes"
         );
     }
 

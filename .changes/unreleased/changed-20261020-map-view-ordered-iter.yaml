@@ -1,0 +1,4 @@
+kind: Changed
+body: |-
+    MapView::iter_unique skips index sorting for key-ordered map entries while preserving last-write-wins and wire-order semantics.
+time: 2026-10-20T18:57:00+02:00
