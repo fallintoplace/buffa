@@ -3909,9 +3909,7 @@ mod tests {
                         .iter()
                         .enumerate()
                         .filter(|(i, (key, _))| {
-                            !entries[i + 1..]
-                                .iter()
-                                .any(|(later, _)| later == key)
+                            !entries[i + 1..].iter().any(|(later, _)| later == key)
                         })
                         .map(|(_, entry)| *entry)
                         .collect();

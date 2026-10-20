@@ -27,9 +27,9 @@ fn before(entries: &[(u32, u32)]) -> usize {
         order.sort_unstable();
         order
     };
-    order
-        .into_iter()
-        .fold(0usize, |acc, i| acc.wrapping_add((entries[i].0 as usize).wrapping_mul(31) ^ entries[i].1 as usize))
+    order.into_iter().fold(0usize, |acc, i| {
+        acc.wrapping_add((entries[i].0 as usize).wrapping_mul(31) ^ entries[i].1 as usize)
+    })
 }
 
 fn after(map: &MapView<'_, u32, u32>) -> usize {
@@ -89,7 +89,9 @@ fn bench(name: &str, entries: Vec<(u32, u32)>) {
 fn main() {
     println!("MapView::iter_unique, release, {} interleaved samples; includes index allocation and traversal", SAMPLES);
     let mk = |len: u32, modulo: u32| -> Vec<(u32, u32)> {
-        (0..len).map(|i| ((i.wrapping_mul(7) + 3) % modulo, i)).collect()
+        (0..len)
+            .map(|i| ((i.wrapping_mul(7) + 3) % modulo, i))
+            .collect()
     };
     bench("one", mk(1, 1));
     bench("two-unique", mk(2, 2));
