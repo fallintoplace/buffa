@@ -263,6 +263,29 @@ fn push_utf8(out: &mut Vec<u8>, cp: u32) -> Result<(), UnescapeError> {
 /// Propagates [`core::fmt::Error`] from the underlying writer.
 pub fn escape_bytes<W: Write + ?Sized>(bytes: &[u8], w: &mut W) -> core::fmt::Result {
     w.write_char('"')?;
+
+    if bytes.len() >= 64 {
+        // A long printable ASCII prefix can be passed to the writer at once.
+        // The rest keeps the same escape handling as a short or binary field.
+        let prefix = bytes
+            .iter()
+            .position(|&b| !matches!(b, 0x20..=0x7E) || b == b'"' || b == b'\\')
+            .unwrap_or(bytes.len());
+        if prefix >= 64 {
+            // The prefix contains only ASCII, so UTF-8 validation cannot fail.
+            let plain = core::str::from_utf8(&bytes[..prefix]).expect("printable ASCII is UTF-8");
+            w.write_str(plain)?;
+            write_escaped_bytes(&bytes[prefix..], w)?;
+            return w.write_char('"');
+        }
+    }
+
+    write_escaped_bytes(bytes, w)?;
+    w.write_char('"')
+}
+
+#[inline]
+fn write_escaped_bytes<W: Write + ?Sized>(bytes: &[u8], w: &mut W) -> core::fmt::Result {
     for &b in bytes {
         match b {
             b'"' => w.write_str("\\\"")?,
@@ -272,8 +295,7 @@ pub fn escape_bytes<W: Write + ?Sized>(bytes: &[u8], w: &mut W) -> core::fmt::Re
             b'\t' => w.write_str("\\t")?,
             0x20..=0x7E => w.write_char(b as char)?,
             _ => {
-                // Three-digit octal. Always three digits so the next char
-                // can't be misread as continuing the escape.
+                // Three-digit octal so the next char cannot extend the escape.
                 w.write_char('\\')?;
                 w.write_char((b'0' + (b >> 6)) as char)?;
                 w.write_char((b'0' + ((b >> 3) & 7)) as char)?;
@@ -281,7 +303,7 @@ pub fn escape_bytes<W: Write + ?Sized>(bytes: &[u8], w: &mut W) -> core::fmt::Re
             }
         }
     }
-    w.write_char('"')
+    Ok(())
 }
 
 /// Write `s` as a double-quoted textproto string literal to `w`, preserving
@@ -578,6 +600,158 @@ mod tests {
             escape_bytes(input, &mut escaped).unwrap();
             let back = unescape(&escaped).unwrap();
             assert_eq!(back, input, "escaped form: {escaped}");
+        }
+    }
+
+    // Keep the previous implementation as a reference for parity and the
+    // ignored, opt-in microbenchmark below.
+    fn original_escape_bytes<W: Write + ?Sized>(bytes: &[u8], w: &mut W) -> core::fmt::Result {
+        w.write_char('"')?;
+        for &b in bytes {
+            match b {
+                b'"' => w.write_str("\\\"")?,
+                b'\\' => w.write_str("\\\\")?,
+                b'\n' => w.write_str("\\n")?,
+                b'\r' => w.write_str("\\r")?,
+                b'\t' => w.write_str("\\t")?,
+                0x20..=0x7E => w.write_char(b as char)?,
+                _ => {
+                    // Three-digit octal. Always three digits so the next char
+                    // can't be misread as continuing the escape.
+                    w.write_char('\\')?;
+                    w.write_char((b'0' + (b >> 6)) as char)?;
+                    w.write_char((b'0' + ((b >> 3) & 7)) as char)?;
+                    w.write_char((b'0' + (b & 7)) as char)?;
+                }
+            }
+        }
+        w.write_char('"')
+    }
+
+    #[test]
+    fn escape_bytes_ascii_fast_path_matches_original_across_boundaries() {
+        let mut cases = alloc::vec![
+            alloc::vec![],
+            alloc::vec![b'a'; 32],
+            alloc::vec![b'a'; 63],
+            alloc::vec![b'a'; 64],
+            alloc::vec![b'"'; 257],
+            alloc::vec![b'\\'; 257],
+            alloc::vec![b'\n'; 257],
+            alloc::vec![0x7F; 257],
+            alloc::vec![0x80; 257],
+            alloc::vec![0xFF; 1024],
+        ];
+        for len in [
+            0usize, 1, 2, 3, 7, 31, 32, 63, 64, 65, 127, 128, 254, 255, 256, 257, 1023,
+        ] {
+            cases.push((0..len).map(|i| ((i * 71 + 37) % 256) as u8).collect());
+        }
+        cases.push((0..256).map(|n| n as u8).collect());
+        let mut trailing = alloc::vec![b'x'; 256];
+        trailing.push(b'\n');
+        cases.push(trailing);
+
+        for input in cases {
+            let mut old = String::new();
+            let mut new = String::new();
+            original_escape_bytes(&input, &mut old).unwrap();
+            escape_bytes(&input, &mut new).unwrap();
+            assert_eq!(new, old, "length {}", input.len());
+            assert_eq!(unescape(&new).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn escape_bytes_ascii_fast_path_propagates_writer_errors() {
+        struct FailAfter {
+            successful_writes: usize,
+        }
+        impl core::fmt::Write for FailAfter {
+            fn write_str(&mut self, _: &str) -> core::fmt::Result {
+                if self.successful_writes == 0 {
+                    return Err(core::fmt::Error);
+                }
+                self.successful_writes -= 1;
+                Ok(())
+            }
+        }
+
+        let payload = alloc::vec![0xFF; 1024];
+        for successful_writes in 0..4 {
+            let mut writer = FailAfter { successful_writes };
+            assert_eq!(escape_bytes(&payload, &mut writer), Err(core::fmt::Error));
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore = "manual performance benchmark, run with --release -- --ignored --nocapture"]
+    fn bench_escape_bytes_ascii_fast_path() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn measure(
+            input: &[u8],
+            encode: fn(&[u8], &mut String) -> core::fmt::Result,
+            iterations: usize,
+        ) -> f64 {
+            let mut out = String::with_capacity(input.len() * 4 + 2);
+            let start = Instant::now();
+            for _ in 0..iterations {
+                out.clear();
+                encode(black_box(input), &mut out).unwrap();
+                black_box(&out);
+            }
+            start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
+        }
+
+        let small = alloc::vec![b'x'; 8];
+        let ascii = alloc::vec![b'a'; 4096];
+        let binary: Vec<u8> = (0..4096).map(|i| (i as u8).wrapping_mul(137)).collect();
+        let mixed: Vec<u8> = (0..4096)
+            .map(|i| match i % 32 {
+                0 => b'\n',
+                1 => b'"',
+                2 => b'\\',
+                3 => 0xFF,
+                _ => b'x',
+            })
+            .collect();
+        let sparse: Vec<u8> = (0..4096)
+            .map(|i| if i % 256 == 0 { b'\n' } else { b'x' })
+            .collect();
+        let mut trailing = alloc::vec![b'a'; 4096];
+        trailing[4095] = b'\n';
+        let cases = [
+            ("trailing_escape_4k", trailing.as_slice(), 4_000),
+            ("short_8", small.as_slice(), 80_000usize),
+            ("ascii_4k", ascii.as_slice(), 4_000),
+            ("binary_4k", binary.as_slice(), 4_000),
+            ("mixed_4k", mixed.as_slice(), 4_000),
+            ("sparse_4k", sparse.as_slice(), 4_000),
+        ];
+
+        for (name, input, iterations) in cases {
+            let mut old = alloc::vec::Vec::with_capacity(7);
+            let mut new = alloc::vec::Vec::with_capacity(7);
+            for round in 0..7 {
+                if round % 2 == 0 {
+                    old.push(measure(input, original_escape_bytes::<String>, iterations));
+                    new.push(measure(input, escape_bytes::<String>, iterations));
+                } else {
+                    new.push(measure(input, escape_bytes::<String>, iterations));
+                    old.push(measure(input, original_escape_bytes::<String>, iterations));
+                }
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            eprintln!(
+                "{name}: old {:.1} ns/op, new {:.1} ns/op ({:.2}x)",
+                old[3],
+                new[3],
+                old[3] / new[3]
+            );
         }
     }
 }
