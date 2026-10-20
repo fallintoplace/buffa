@@ -189,19 +189,27 @@ pub fn serialize_extensions<S: serde::Serializer>(
         return map.end();
     }
 
-    // Emit each extension once: the first record at a field number triggers
-    // the lookup; the entry's to_json reads all records at that number (for
-    // merge-semantics on messages, last-wins on scalars, collect on repeated).
-    let mut seen: HashSet<u32> = HashSet::with_capacity(fields.len());
+    // Resolve the extendee's bucket once. A globally installed registry may
+    // have no extensions for this message at all.
+    let Some(entries) = reg.by_number.get(extendee) else {
+        return map.end();
+    };
+
+    // Emit each registered extension once, at its first wire occurrence.
+    // Unregistered fields need neither deduplication nor an allocation:
+    // the entry's to_json scans all records at its number (merge semantics
+    // on messages, last-wins on scalars, collect on repeated).
+    let mut seen: HashSet<u32> = HashSet::new();
     for uf in fields.iter() {
+        let Some(entry) = entries.get(&uf.number) else {
+            continue;
+        };
         if !seen.insert(uf.number) {
             continue;
         }
-        if let Some(entry) = reg.by_number(extendee, uf.number) {
-            let json = (entry.to_json)(uf.number, fields).map_err(S::Error::custom)?;
-            let key = format!("[{}]", entry.full_name);
-            map.serialize_entry(&key, &json)?;
-        }
+        let json = (entry.to_json)(uf.number, fields).map_err(S::Error::custom)?;
+        let key = format!("[{}]", entry.full_name);
+        map.serialize_entry(&key, &json)?;
     }
     map.end()
 }
@@ -1407,6 +1415,56 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({"[pkg.weight]": 9}));
+    }
+
+    #[test]
+    fn serialize_extensions_skips_other_extendees_and_keeps_first_wire_order() {
+        let _guard = crate::test_doubles::REGISTRY_TEST_LOCK.lock().unwrap();
+        let mut reg = ExtensionRegistry::new();
+        reg.register(entry!(50, "pkg.weight", "pkg.Carrier"));
+        reg.register(entry!(51, "pkg.length", "pkg.Carrier"));
+        reg.register(entry!(52, "pkg.other", "other.Msg"));
+        set_extension_registry(Box::new(reg));
+
+        let mut fields = UnknownFields::new();
+        for (number, value) in [(50, 7), (999, 1), (51, 3), (50, 9), (51, 4)] {
+            fields.push(UnknownField {
+                number,
+                data: UnknownFieldData::Varint(value),
+            });
+        }
+
+        // Two registered keys keep first-seen wire order, but each value is
+        // decoded from all occurrences (last write wins for int32).
+        assert_eq!(
+            serde_json::to_string(&SerWrap {
+                extendee: "pkg.Carrier",
+                fields: &fields,
+            })
+            .unwrap(),
+            r#"{"[pkg.weight]":9,"[pkg.length]":4}"#
+        );
+
+        // No matching registry bucket: none of this message's unknown fields
+        // are JSON extensions even though the global registry is populated.
+        assert_eq!(
+            serde_json::to_string(&SerWrap {
+                extendee: "unregistered.Msg",
+                fields: &fields,
+            })
+            .unwrap(),
+            "{}"
+        );
+
+        // Matching another extendee does not accidentally emit its entries.
+        assert_eq!(
+            serde_json::to_string(&SerWrap {
+                extendee: "other.Msg",
+                fields: &fields,
+            })
+            .unwrap(),
+            "{}"
+        );
     }
 
     // Helper: a Serialize wrapper that calls serialize_extensions.
