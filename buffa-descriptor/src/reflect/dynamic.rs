@@ -2926,6 +2926,38 @@ mod tests {
         assert_eq!(decoded, expected);
     }
 
+
+    #[test]
+    fn contiguous_closed_enum_maps_only_copy_rejected_entries() {
+        use alloc::sync::Arc;
+        use buffa::bytes::Buf;
+
+        use crate::DescriptorPool;
+
+        let pool = Arc::new(
+            DescriptorPool::decode(include_bytes!("../../tests/protos/reflect_test.fds")).unwrap(),
+        );
+        let idx = pool.message_index("reflect.closed.Contexts").unwrap();
+        // Map key "k", with a known status (1) and an unknown status (99).
+        for raw in [1, 99] {
+            let wire = [0x2a, 0x05, 0x0a, 0x01, b'k', 0x10, raw];
+            let budget = core::cell::Cell::new(100);
+            let mut input = NoPayloadCopy(&wire);
+            let mut decoded = DynamicMessage::new(Arc::clone(&pool), idx);
+            decoded
+                .merge_buf(
+                    &mut input,
+                    buffa::DecodeContext::new(buffa::RECURSION_LIMIT, &budget),
+                )
+                .unwrap();
+            assert_eq!(input.remaining(), 0);
+            assert_eq!(
+                decoded,
+                DynamicMessage::decode(Arc::clone(&pool), idx, &wire).unwrap(),
+            );
+        }
+    }
+
     #[test]
     fn failed_contiguous_payloads_consume_the_field_but_not_following_fields() {
         use alloc::sync::Arc;
