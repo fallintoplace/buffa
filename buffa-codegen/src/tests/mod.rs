@@ -57,6 +57,7 @@ mod element_memory_limit;
 mod excluded_refs;
 mod feature_gating;
 mod field_rule_warnings;
+mod file_selection;
 mod generation;
 mod idiomatic_enums;
 mod idiomatic_fields;

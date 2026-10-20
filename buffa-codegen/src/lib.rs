@@ -2733,12 +2733,21 @@ fn generated_files<'a>(
     file_descriptors: &'a [FileDescriptorProto],
     files_to_generate: &'a [String],
 ) -> impl Iterator<Item = (&'a FileDescriptorProto, String)> {
+    // Most requests generate a handful of files. For large requests, avoid
+    // scanning the requested names once per descriptor in the full corpus.
+    let name_index = (files_to_generate.len() >= 32).then(|| {
+        files_to_generate
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>()
+    });
     file_descriptors
         .iter()
         .filter(move |fd| {
-            fd.name
-                .as_deref()
-                .is_some_and(|n| files_to_generate.iter().any(|g| g == n))
+            fd.name.as_deref().is_some_and(|name| match &name_index {
+                Some(index) => index.contains(name),
+                None => files_to_generate.iter().any(|requested| requested == name),
+            })
         })
         .map(|fd| {
             let package = fd.package.as_deref().unwrap_or("");
@@ -2974,11 +2983,25 @@ fn collect_custom_elements(
     }
 
     let mut out = CustomElements::default();
+    // Large requests otherwise scan the full descriptor corpus for each
+    // requested file. Retain the first descriptor for duplicate filenames.
+    let file_index = (files_to_generate.len() >= 32 && file_descriptors.len() >= 32).then(|| {
+        let mut index = std::collections::HashMap::with_capacity(file_descriptors.len());
+        for file in file_descriptors.iter().rev() {
+            if let Some(name) = file.name.as_deref() {
+                index.insert(name, file);
+            }
+        }
+        index
+    });
     for file_name in files_to_generate {
-        let Some(file) = file_descriptors
-            .iter()
-            .find(|f| f.name.as_deref() == Some(file_name.as_str()))
-        else {
+        let file = match &file_index {
+            Some(index) => index.get(file_name.as_str()).copied(),
+            None => file_descriptors
+                .iter()
+                .find(|f| f.name.as_deref() == Some(file_name.as_str())),
+        };
+        let Some(file) = file else {
             continue;
         };
         let pkg = file.package.as_deref().unwrap_or("");
@@ -3589,15 +3612,30 @@ pub fn generate_with_diagnostics(
     let mut by_package: std::collections::BTreeMap<String, Vec<&FileDescriptorProto>> =
         std::collections::BTreeMap::new();
     let mut grouped = std::collections::HashSet::new();
+    // Index only large multi-file requests, where repeated linear searches
+    // dominate selection. Reverse iteration preserves first-match semantics
+    // if the descriptor corpus contains duplicate file names.
+    let file_index = (files_to_generate.len() >= 32 && file_descriptors.len() >= 32).then(|| {
+        let mut index = std::collections::HashMap::with_capacity(file_descriptors.len());
+        for file in file_descriptors.iter().rev() {
+            if let Some(name) = file.name.as_deref() {
+                index.insert(name, file);
+            }
+        }
+        index
+    });
     for file_name in files_to_generate {
         // A file listed twice is generated once.
         if !grouped.insert(file_name.as_str()) {
             continue;
         }
-        let file_desc = file_descriptors
-            .iter()
-            .find(|f| f.name.as_deref() == Some(file_name.as_str()))
-            .ok_or_else(|| CodeGenError::FileNotFound(file_name.clone()))?;
+        let file_desc = match &file_index {
+            Some(index) => index.get(file_name.as_str()).copied(),
+            None => file_descriptors
+                .iter()
+                .find(|f| f.name.as_deref() == Some(file_name.as_str())),
+        }
+        .ok_or_else(|| CodeGenError::FileNotFound(file_name.clone()))?;
         let pkg = file_desc.package.as_deref().unwrap_or("").to_string();
         by_package.entry(pkg).or_default().push(file_desc);
     }
