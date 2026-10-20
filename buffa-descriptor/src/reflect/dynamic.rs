@@ -535,7 +535,7 @@ impl DynamicMessage {
                 if buf.remaining() < len {
                     return Err(DecodeError::UnexpectedEof);
                 }
-                let mut sub = buf.copy_to_bytes(len);
+                let mut sub = buf.take(len);
                 existing.merge_buf(&mut sub, ctx)
             }
             WireType::StartGroup => existing.merge_group(buf, tag.field_number(), ctx),
@@ -604,8 +604,8 @@ impl DynamicMessage {
                     });
                 list.reserve(additional);
             }
-            // Take a sub-buffer of `len` bytes and decode elements from it.
-            let mut packed = buf.copy_to_bytes(len);
+            // Bound decoding to this field without copying the packed payload.
+            let mut packed = buf.take(len);
             while packed.has_remaining() {
                 // Charged, unlike the generated decoder: that exemption is
                 // sized for a `Vec<i32>`, and this store is a `Vec<Value>`.
@@ -647,7 +647,7 @@ impl DynamicMessage {
             if buf.remaining() < len {
                 return Err(DecodeError::UnexpectedEof);
             }
-            let mut packed = buf.copy_to_bytes(len);
+            let mut packed = buf.take(len);
             while packed.has_remaining() {
                 let raw = decode_int32(&mut packed)?;
                 if self.enum_value_is_known(eidx, Some(EnumType::Closed), raw) {
@@ -713,7 +713,7 @@ impl DynamicMessage {
         if buf.remaining() < len {
             return Err(DecodeError::UnexpectedEof);
         }
-        let mut entry = buf.copy_to_bytes(len);
+        let mut entry = buf.take(len);
         let mut key: Option<MapKey> = None;
         let mut value: Option<Value> = None;
         while entry.has_remaining() {
@@ -910,7 +910,7 @@ impl DynamicMessage {
                 if buf.remaining() < len {
                     return Err(DecodeError::UnexpectedEof);
                 }
-                let mut sub = buf.copy_to_bytes(len);
+                let mut sub = buf.take(len);
                 nested.merge_buf(&mut sub, ctx)
             }
             WireType::StartGroup => nested.merge_group(buf, tag.field_number(), ctx),
@@ -2897,6 +2897,165 @@ mod tests {
 
         assert!(msg.field_by_number(999).is_some());
         assert_eq!(msg.iter_set_fields().count(), 0);
+    }
+
+    mod bounded_decode {
+        use super::DynamicMessage;
+        use crate::reflect::Value;
+        use crate::DescriptorPool;
+        use alloc::sync::Arc;
+        use buffa::bytes::{Buf, Bytes};
+        use buffa::{DecodeContext, DecodeError};
+        use core::cell::Cell;
+
+        // Fail if a container decoder copies its bounded payload.
+        struct NoCopyBuf<'a>(&'a [u8]);
+
+        impl Buf for NoCopyBuf<'_> {
+            fn remaining(&self) -> usize {
+                self.0.len()
+            }
+
+            fn chunk(&self) -> &[u8] {
+                self.0
+            }
+
+            fn advance(&mut self, count: usize) {
+                self.0.advance(count);
+            }
+
+            fn copy_to_bytes(&mut self, _len: usize) -> Bytes {
+                panic!("container decode copied its payload")
+            }
+        }
+
+        fn pool() -> Arc<DescriptorPool> {
+            Arc::new(
+                DescriptorPool::decode(include_bytes!("../../tests/protos/reflect_test.fds"))
+                    .unwrap(),
+            )
+        }
+
+        fn context<'a>(
+            unknown: &'a Cell<usize>,
+            elements: &'a Cell<usize>,
+        ) -> DecodeContext<'a> {
+            DecodeContext::new(buffa::RECURSION_LIMIT, unknown).with_element_memory(elements)
+        }
+
+        #[test]
+        fn packed_lists_maps_and_nested_messages_do_not_copy_containers() {
+            let pool = pool();
+            let idx = pool.message_index("reflect.test.Containers").unwrap();
+            // Packed ints, map entry with default key, nested message, then
+            // additional packed ints and another occurrence of the same message.
+            let wire: &[u8] = &[
+                0x0A, 0x03, 0x01, 0x96, 0x01, // packed: 1, 150
+                0x1A, 0x02, 0x10, 0x09, // map: empty key, value 9
+                0x2A, 0x02, 0x10, 0x2A, // nested: value 42
+                0x0A, 0x01, 0x07, // packed: append 7
+                0x2A, 0x02, 0x10, 0x08, // nested: merge value 8
+            ];
+            let unknown = Cell::new(buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+            let elements = Cell::new(buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+            let mut input = NoCopyBuf(wire);
+            let mut msg = DynamicMessage::new(pool, idx);
+            msg.merge_buf(&mut input, context(&unknown, &elements))
+                .unwrap();
+
+            assert_eq!(input.remaining(), 0);
+            assert_eq!(
+                msg.field_by_number(1),
+                Some(&Value::List(alloc::vec![
+                    Value::I32(1),
+                    Value::I32(150),
+                    Value::I32(7),
+                ]))
+            );
+            let Some(Value::Map(map)) = msg.field_by_number(3) else {
+                panic!("map missing");
+            };
+            assert_eq!(map.get_str(""), Some(&Value::I32(9)));
+            let Some(Value::Message(child)) = msg.field_by_number(5) else {
+                panic!("nested message missing");
+            };
+            assert_eq!(child.field_by_number(2), Some(&Value::I32(8)));
+        }
+
+        #[test]
+        fn closed_enum_packed_values_do_not_copy_payload() {
+            let pool = pool();
+            let idx = pool.message_index("reflect.closed.Contexts").unwrap();
+            // Packed repeated closed enum with one unknown value.
+            let wire: &[u8] = &[0x1A, 0x03, 0x00, 0x63, 0x01];
+            let unknown = Cell::new(buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+            let elements = Cell::new(buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+            let mut input = NoCopyBuf(wire);
+            let mut msg = DynamicMessage::new(pool, idx);
+            msg.merge_buf(&mut input, context(&unknown, &elements))
+                .unwrap();
+
+            assert_eq!(input.remaining(), 0);
+            assert_eq!(
+                msg.field_by_number(3),
+                Some(&Value::List(alloc::vec![
+                    Value::EnumNumber(0),
+                    Value::EnumNumber(1),
+                ]))
+            );
+            assert_eq!(msg.unknown_fields().iter().count(), 1);
+        }
+
+        #[test]
+        fn bounded_decode_handles_fragmented_buffers_and_malformed_payloads() {
+            let pool = pool();
+            let idx = pool.message_index("reflect.test.Containers").unwrap();
+            let wire: &[u8] = &[
+                0x0A, 0x03, 0x01, 0x96, 0x01, // packed: 1, 150
+                0x1A, 0x02, 0x10, 0x09, // map: empty key, value 9
+                0x2A, 0x02, 0x10, 0x2A, // nested: value 42
+                0x0A, 0x01, 0x07, // packed: append 7
+                0x2A, 0x02, 0x10, 0x08, // nested: merge value 8
+            ];
+            let expected = DynamicMessage::decode(Arc::clone(&pool), idx, wire).unwrap();
+            for split in 0..=wire.len() {
+                let mut input = (&wire[..split]).chain(&wire[split..]);
+                let unknown = Cell::new(buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+                let elements = Cell::new(buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+                let mut msg = DynamicMessage::new(Arc::clone(&pool), idx);
+                msg.merge_buf(&mut input, context(&unknown, &elements))
+                    .unwrap();
+                assert_eq!(msg, expected, "split at {split}");
+                assert_eq!(input.remaining(), 0);
+            }
+
+            // A truncated payload may not consume the following field's bytes.
+            let malformed: &[(&str, &[u8])] = &[
+                ("packed", &[0x0A, 0x01, 0x80, 0x08, 0x01]),
+                ("nested", &[0x2A, 0x01, 0x10, 0x08, 0x01]),
+                ("map", &[0x1A, 0x01, 0x10, 0x08, 0x01]),
+            ];
+            for &(name, wire) in malformed {
+                assert!(
+                    matches!(
+                        DynamicMessage::decode(Arc::clone(&pool), idx, wire),
+                        Err(DecodeError::UnexpectedEof)
+                    ),
+                    "{name}"
+                );
+                for split in 0..=wire.len() {
+                    let mut input = (&wire[..split]).chain(&wire[split..]);
+                    let unknown = Cell::new(buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+                    let elements = Cell::new(buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+                    let mut msg = DynamicMessage::new(Arc::clone(&pool), idx);
+                    assert_eq!(
+                        msg.merge_buf(&mut input, context(&unknown, &elements)),
+                        Err(DecodeError::UnexpectedEof),
+                        "{name}: split at {split}"
+                    );
+                }
+            }
+        }
     }
 
     mod empty_message {

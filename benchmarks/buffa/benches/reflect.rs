@@ -356,11 +356,50 @@ fn benchmark_google_message1(c: &mut Criterion) {
     );
 }
 
+/// Isolate the cost of decoding large packed scalar payloads reflectively.
+fn benchmark_packed_reflect_decode(c: &mut Criterion) {
+    use buffa::encoding::{encode_varint, Tag, WireType};
+
+    let pool = Arc::new(
+        DescriptorPool::decode(include_bytes!(
+            "../../../buffa-descriptor/tests/protos/reflect_test_options.fds"
+        ))
+        .expect("descriptor set"),
+    );
+    // Field 10 is FileDescriptorProto.public_dependency (repeated int32).
+    let idx = pool
+        .message_index("google.protobuf.FileDescriptorProto")
+        .expect("descriptor message");
+
+    let mut group = c.benchmark_group("reflect/packed_int32");
+    for count in [128usize, 4096, 65536] {
+        let mut wire = Vec::with_capacity(count + 8);
+        Tag::new(10, WireType::LengthDelimited).encode(&mut wire);
+        encode_varint(count as u64, &mut wire);
+        wire.resize(wire.len() + count, 42);
+        group.throughput(Throughput::Bytes(wire.len() as u64));
+        group.bench_function(format!("{count}"), |b| {
+            b.iter(|| {
+                criterion::black_box(
+                    DynamicMessage::decode(
+                        Arc::clone(&pool),
+                        idx,
+                        criterion::black_box(wire.as_slice()),
+                    )
+                    .expect("reflect decode"),
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     benchmark_api_response,
     benchmark_log_record,
     benchmark_analytics_event,
     benchmark_google_message1,
+    benchmark_packed_reflect_decode,
 );
 criterion_main!(benches);
